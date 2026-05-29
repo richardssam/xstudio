@@ -38,6 +38,7 @@ auto __sysclock_now() { return sysclock::now(); }
 
 const static auto COLOUR_JPOINTER  = nlohmann::json::json_pointer("/xstudio/colour");
 const static auto LOCKED_JPOINTER  = nlohmann::json::json_pointer("/xstudio/locked");
+const static auto UUID_JPOINTER    = nlohmann::json::json_pointer("/xstudio/uuid");
 const static auto CONFORM_JPOINTER = nlohmann::json::json_pointer("/xstudio/conform_track");
 const static auto ENABLED_JPOINTER = nlohmann::json::json_pointer("/xstudio/enabled");
 const static auto MEDIA_COLOUR_JPOINTER = nlohmann::json::json_pointer("/xstudio/media_colour");
@@ -3323,10 +3324,11 @@ void TimelineActor::export_otio_as_string(caf::typed_response_promise<std::strin
         meta.erase("conform_track_uuid");
 
         auto xstudio_meta =
-            R"({"xstudio": {"colour": "", "enabled": true, "locked": false}})"_json;
+            R"({"xstudio": {"colour": "", "enabled": true, "locked": false, "uuid": ""}})"_json;
         xstudio_meta[COLOUR_JPOINTER]  = base_.item().flag();
         xstudio_meta[ENABLED_JPOINTER] = base_.item().enabled();
         xstudio_meta[LOCKED_JPOINTER]  = base_.item().locked();
+        xstudio_meta[UUID_JPOINTER]    = to_string(base_.item().uuid());
         meta.update(xstudio_meta, true);
         deserialize_json_from_string(meta.dump(), &jany, &err);
         // if(is_error(err)) {
@@ -3367,10 +3369,11 @@ void TimelineActor::export_otio_as_string(caf::typed_response_promise<std::strin
                     meta = R"({})"_json;
 
                 xstudio_meta =
-                    R"({"xstudio": {"colour": "", "enabled": true, "locked": false}})"_json;
+                    R"({"xstudio": {"colour": "", "enabled": true, "locked": false, "uuid": ""}})"_json;
                 xstudio_meta[COLOUR_JPOINTER]  = item.flag();
                 xstudio_meta[ENABLED_JPOINTER] = item.enabled();
                 xstudio_meta[LOCKED_JPOINTER]  = item.locked();
+                xstudio_meta[UUID_JPOINTER]    = to_string(item.uuid());
 
                 if (item.uuid() == conform_track_uuid)
                     xstudio_meta["xstudio"]["conform_track"] = true;
@@ -3418,10 +3421,11 @@ void TimelineActor::export_otio_as_string(caf::typed_response_promise<std::strin
                         result->append_child(gap);
                     } else if (citem.item_type() == IT_CLIP) {
                         xstudio_meta =
-                            R"({"xstudio": {"colour": "", "media_colour": "", "enabled": true, "locked": false}})"_json;
+                            R"({"xstudio": {"colour": "", "media_colour": "", "enabled": true, "locked": false, "uuid": ""}})"_json;
                         xstudio_meta[COLOUR_JPOINTER]  = citem.flag();
                         xstudio_meta[ENABLED_JPOINTER] = citem.enabled();
                         xstudio_meta[LOCKED_JPOINTER]  = citem.locked();
+                        xstudio_meta[UUID_JPOINTER]    = to_string(citem.uuid());
 
                         // need to get the media flag..
                         try {
