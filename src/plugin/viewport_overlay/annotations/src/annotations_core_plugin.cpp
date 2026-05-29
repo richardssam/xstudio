@@ -1291,13 +1291,34 @@ void AnnotationsCore::broadcast_live_stroke(
     if (user_edit_data->live_stroke)
         anno->canvas().append_item(*(user_edit_data->live_stroke));
 
-    mail(
-        utility::event_atom_v,
-        annotation_data_atom_v,
-        AnnotationBasePtr(anno),
-        user_id,
-        stroke_completed)
+    AnnotationBasePtr anno_ptr(anno);
+
+    mail(utility::event_atom_v, annotation_data_atom_v, anno_ptr, user_id, stroke_completed)
         .send(live_edit_event_group_);
+
+    // Python-accessible event: AnnotationBasePtr is not Python-bound, so broadcast
+    // the serialised geometry via plugin_events_ so Python plugins can render
+    // in-progress strokes directly, without polling/hot-scanning bookmarks.
+    // Shapes (as opposed to pen/brush strokes) are only broadcast on pen-up,
+    // since a shape isn't a meaningful annotation until the drag completes.
+    const bool is_shape = user_edit_data->item_type == Canvas::ItemType::Square ||
+                           user_edit_data->item_type == Canvas::ItemType::Circle ||
+                           user_edit_data->item_type == Canvas::ItemType::Arrow ||
+                           user_edit_data->item_type == Canvas::ItemType::Line ||
+                           user_edit_data->item_type == Canvas::ItemType::Ellipse;
+
+    if (!is_shape || stroke_completed) {
+        utility::Uuid plugin_uuid;
+        utility::JsonStore anno_json = anno_ptr->serialise(plugin_uuid);
+
+        mail(
+            utility::event_atom_v,
+            annotation_data_atom_v,
+            anno_json,
+            user_id,
+            stroke_completed)
+            .send(plugin_events_group());
+    }
 }
 
 void AnnotationsCore::broadcast_live_laser_stroke(

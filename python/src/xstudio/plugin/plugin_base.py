@@ -296,7 +296,7 @@ class PluginBase(ModuleBase):
             raise Exception("Actor has no event group.")
 
         return self.connection.link.add_message_callback(
-            event_group, callback_method
+            event_group, callback_method, plugin.remote
             )
 
     def register_ui_panel_qml(self,
