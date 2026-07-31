@@ -96,7 +96,10 @@ class py_context : public py_config {
     py::function my_func;
     std::thread my_thread;
 
-    caf::actor message_callback_handler_actor_;
+    // one listener actor per subscription, keyed by callback id, so that
+    // subscriptions cannot interfere with one another's group membership or
+    // event delivery. See EventToPythonThreadLockerActor in py_context.cpp.
+    std::map<xstudio::utility::Uuid, caf::actor> message_callback_handler_actors_;
     std::map<xstudio::utility::Uuid, py::function> message_callback_funcs_;
     std::map<xstudio::utility::Uuid, py::object> plugin_registry_;
 };

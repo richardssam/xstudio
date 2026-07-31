@@ -13,100 +13,83 @@
 
 namespace caf::python {
 
-/* This actor receives event messages from actors (xstudio components) that
-Python plugins want to get messages from. It then sends the message back
-to the py_context object which has registered the python callback functions
-from the Python plugins, and executes the relevant callback function*/
+/* This actor receives event messages from ONE actor (an xstudio event group) that
+a Python plugin wants to get messages from. It then sends the message back to the
+py_context object which has registered the python callback functions from the
+Python plugins, and executes the callback function this listener belongs to.
+
+There is one instance of this actor per subscription, NOT one per connection. That
+is deliberate, and load bearing:
+
+  - It joins exactly one broadcast group, so every event message it receives
+    provably belongs to that group. No dispatch on current_sender() is needed, and
+    therefore it does not matter that the sender is sometimes the group's owner
+    (BroadcastActor forwards with send_as(current_sender(), ...)) and sometimes the
+    group itself (when the event was emitted with anon_mail, current_sender() is
+    null and the group forwards as itself). Address based dispatch could not tell
+    those apart, and could not tell two groups sharing an owner apart either -- a
+    PlayheadActor owns five broadcast groups plus the Module base class's
+    attribute_events_group_, so callbacks on different groups were being invoked
+    with each other's events.
+
+  - BroadcastActor::subscribers_ is a set keyed by subscriber address. With one
+    shared listener, every Python subscription reaching a group collapsed onto a
+    single membership, so unsubscribing any one callback revoked the group
+    membership that the others were still relying on. Per-subscription listeners
+    have distinct addresses, so a leave affects only its own subscription.
+*/
 class EventToPythonThreadLockerActor : public caf::event_based_actor {
   public:
-    EventToPythonThreadLockerActor(caf::actor_config &cfg, py_context *context)
-        : caf::event_based_actor(cfg), context_(context) {
+    EventToPythonThreadLockerActor(
+        caf::actor_config &cfg,
+        py_context *context,
+        caf::actor events_source,
+        xstudio::utility::Uuid callback_id)
+        : caf::event_based_actor(cfg),
+          context_(context),
+          events_source_(std::move(events_source)),
+          callback_id_(std::move(callback_id)) {
 
         behavior_.assign(
-            [=](xstudio::broadcast::broadcast_down_atom, const caf::actor_addr &actor) {
-                auto p = actor_to_callback_uuid_.find(actor);
-                if (p != actor_to_callback_uuid_.end()) {
-                    actor_to_callback_uuid_.erase(p);
+            [=](xstudio::broadcast::broadcast_down_atom, const caf::actor_addr &) {
+                // our event group has gone away - there is nothing left to listen
+                // to. The python side callback stays registered until the plugin
+                // removes it; it simply stops being called.
+                events_source_ = caf::actor();
+                quit();
+            },
+            [=](xstudio::broadcast::leave_broadcast_atom) {
+                // stop watching, then wind ourselves up. Only this subscription's
+                // membership is affected.
+                if (events_source_) {
+                    mail(
+                        xstudio::broadcast::leave_broadcast_atom_v,
+                        caf::actor_cast<caf::actor>(this))
+                        .send(events_source_);
+                    events_source_ = caf::actor();
                 }
+                quit();
             },
-            [=](const xstudio::utility::Uuid &callback_id) {
-                // stop watching
-
-                // find actor that has its events forwarded to the callback with
-                // the given ID
-                auto p = actor_to_callback_uuid_.begin();
-                while (p != actor_to_callback_uuid_.end()) {
-
-                    auto q = p->second.begin();
-                    while (q != p->second.end()) {
-                        if (*q == callback_id) {
-                            q = p->second.erase(q);
-                        } else {
-                            q++;
-                        }
-                    }
-
-                    if (p->second.empty()) {
-                        // don't need to get events from this actor any more
-                        auto events_source = caf::actor_cast<caf::actor>(p->first);
-                        if (events_source) {
-                            mail(
-                                xstudio::broadcast::leave_broadcast_atom_v,
-                                caf::actor_cast<caf::actor>(this))
-                                .send(events_source);
-                        }
-                        p = actor_to_callback_uuid_.erase(p);
-                    } else {
-                        p++;
-                    }
-                }
-            },
-            [=](caf::actor events_source, const xstudio::utility::Uuid &callback_id) {
-
-                actor_to_callback_uuid_[caf::actor_cast<caf::actor_addr>(events_source)]
-                    .push_back(callback_id);
-
-                // generally events emitted by an event_group appear to come from the PARENT
-                // of the event_group. This isn't 100% reliable, though, if an anon_send is
-                // used for the event message it appears to come from the event_group itself.
-                // So we will register the callback with the parent of the event_group, if 
-                // we can find it as well as the event_group itself.
-                mail(xstudio::utility::parent_atom_v).request(events_source, infinite).then(
-                    [=](caf::actor_addr parent) {
-                        if (parent) {
-                           actor_to_callback_uuid_[caf::actor_cast<caf::actor_addr>(parent)].push_back(callback_id);
-                        }
-                    },
-                    [=](const caf::error &) {
-                        // ignore the error - 'events_source' may not have a parent.
-                    });
-
-                // join the events broadcast
-                mail(
-                    xstudio::broadcast::join_broadcast_atom_v,
-                    caf::actor_cast<caf::actor>(this))
-                    .send(events_source);
-            },
+            // swallow the bool results of join_broadcast/leave_broadcast so they are
+            // not mistaken for event messages by the catch-all below
             [=](bool) {},
-            [=](message &_msg) {
-                auto src = caf::actor_cast<caf::actor_addr>(current_sender());
-                auto p   = actor_to_callback_uuid_.find(src);
-                if (p == actor_to_callback_uuid_.end()) {
-                    spdlog::debug(
-                        "Python event group callback - getting messages from unknown source.");
-                } else {
-                    for (const auto &id : p->second) {
-                        context_->execute_event_callback(_msg, id);
-                    }
-                }
-            });
+            [=](message &_msg) { context_->execute_event_callback(_msg, callback_id_); });
+
+        // join the events broadcast
+        if (events_source_) {
+            mail(
+                xstudio::broadcast::join_broadcast_atom_v,
+                caf::actor_cast<caf::actor>(this))
+                .send(events_source_);
+        }
     }
 
     ~EventToPythonThreadLockerActor() override = default;
 
     caf::behavior behavior_;
     py_context *context_;
-    std::map<caf::actor_addr, std::vector<xstudio::utility::Uuid>> actor_to_callback_uuid_;
+    caf::actor events_source_;
+    xstudio::utility::Uuid callback_id_;
 
     caf::behavior make_behavior() override { return behavior_; }
 };
@@ -451,23 +434,18 @@ xstudio::utility::Uuid py_context::py_add_message_callback(const py::args &xs) {
         auto remote_actor = (*i).cast<caf::actor>();
         i++;
         auto callback_func = (*i).cast<py::function>();
-        auto addr          = caf::actor_cast<caf::actor_addr>(remote_actor);
-
-        // spawn a listener actor to receive the event messages. THis will
-        // run the Python callback (after acquiring the GIL)
-        if (!message_callback_handler_actor_) {
-            message_callback_handler_actor_ =
-                self_->spawn<EventToPythonThreadLockerActor>(this);
-        }
 
         // here we store the python function object - the callback in the Python
         // code
         message_callback_funcs_[uuid] = callback_func;
 
-        // here we message our 'watcher'. It will join the event group of
-        // the 'remote_actor' and when it gets event messages from that actor
-        // it will run the py_callback
-        anon_mail(remote_actor, uuid).send(message_callback_handler_actor_);
+        // spawn a listener actor dedicated to THIS subscription. It joins the
+        // event group of 'remote_actor' and when it gets event messages it runs
+        // the py_callback (after acquiring the GIL). One listener per
+        // subscription keeps subscriptions independent of one another - see the
+        // comment on EventToPythonThreadLockerActor.
+        message_callback_handler_actors_[uuid] =
+            self_->spawn<EventToPythonThreadLockerActor>(this, remote_actor, uuid);
 
     } else {
         throw std::runtime_error(
@@ -479,9 +457,14 @@ xstudio::utility::Uuid py_context::py_add_message_callback(const py::args &xs) {
 
 void py_context::py_remove_message_callback(const xstudio::utility::Uuid &id) {
 
-    if (message_callback_handler_actor_) {
-        anon_mail(id).send(message_callback_handler_actor_);
+    // tell this subscription's listener to leave its broadcast group and quit.
+    // No other subscription's group membership is touched.
+    auto l = message_callback_handler_actors_.find(id);
+    if (l != message_callback_handler_actors_.end()) {
+        anon_mail(xstudio::broadcast::leave_broadcast_atom_v).send(l->second);
+        message_callback_handler_actors_.erase(l);
     }
+
     auto p = message_callback_funcs_.find(id);
     if (p != message_callback_funcs_.end()) {
         message_callback_funcs_.erase(p);
@@ -497,8 +480,10 @@ void py_context::disconnect() {
     port_                  = 0;
     remote_                = actor();
     embedded_python_actor_ = caf::actor();
-    self_->send_exit(message_callback_handler_actor_, caf::exit_reason::user_shutdown);
-    message_callback_handler_actor_ = caf::actor();
+    for (auto &p : message_callback_handler_actors_) {
+        self_->send_exit(p.second, caf::exit_reason::user_shutdown);
+    }
+    message_callback_handler_actors_.clear();
     message_callback_funcs_.clear();
 }
 
