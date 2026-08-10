@@ -3,6 +3,9 @@
 #include "xstudio/media/media.hpp"
 #include "xstudio/session/session_actor.hpp"
 #include "xstudio/timeline/item.hpp"
+#include "xstudio/timeline/timeline_actor.hpp"
+#include "xstudio/timeline/clip_actor.hpp"
+#include "xstudio/timeline/transient_selection_timeline.hpp"
 #include "xstudio/ui/qml/caf_response_ui.hpp"
 #include "xstudio/ui/qml/job_control_ui.hpp"
 #include "xstudio/ui/qml/session_model_ui.hpp"
@@ -1295,16 +1298,205 @@ void SessionModel::updateSelection(
                     }
 
                     anon_mail(playlist::select_media_atom_v, uv, mode).send(actor);
+
+                    // Trigger the debounce for bin-driven sequence synthesis.
+                    // SM_NO_UPDATE is discarded by the backend so it cannot change
+                    // the selection, and must not cause a resynthesis.
+                    if (mode != playhead::SelectionMode::SM_NO_UPDATE and
+                        selection_debounce_timer_) {
+
+                        // Capture which playlist this belongs to, not the selection
+                        // itself - 'uv' is only a delta for SM_SELECT/SM_DESELECT/
+                        // SM_TOGGLE, so deselecting one item would otherwise
+                        // synthesize a sequence containing just that item.
+                        pending_selection_actor_ = actor;
+                        pending_playlist_actor_ =
+                            current_playlist_index_.isValid()
+                                ? actorFromQString(
+                                      system(),
+                                      current_playlist_index_.data(actorRole).toString())
+                                : caf::actor();
+
+                        selection_debounce_timer_->start();
+                    }
                 }
             }
         }
     } catch (const std::exception &err) {
         spdlog::warn("{} {}", __PRETTY_FUNCTION__, err.what());
-        /*if (index.isValid()) {
-            nlohmann::json &j = indexToData(index);
-            spdlog::warn("{}", j.dump(2));
-        }*/
     }
+}
+
+namespace {
+// Tear down a set of actors we spawned. Nothing links them to us, so they have
+// to be exited explicitly or they outlive the sequence they belong to.
+void exit_actors(caf::actor_system &sys_ref, const std::vector<caf::actor> &actors) {
+    if (actors.empty())
+        return;
+    scoped_actor sys{sys_ref};
+    for (const auto &a : actors) {
+        if (a)
+            sys->send_exit(a, caf::exit_reason::user_shutdown);
+    }
+}
+
+// How long any single backend round-trip in the synthesis may take. The old code
+// used caf::infinite on the GUI thread; this work is now on a pool thread, but an
+// unbounded wait there still parks a worker permanently if an actor wedges.
+constexpr auto k_synthesis_timeout = std::chrono::seconds(5);
+} // namespace
+
+void SessionModel::adoptTransientSequence(const std::vector<caf::actor> &actors) {
+    auto previous = transient_sequence_actors_;
+    transient_sequence_actors_ = actors;
+    exit_actors(system(), previous);
+}
+
+void SessionModel::debouncedSelectionChanged() {
+    // Read everything that must come off the GUI thread here, then do the CAF work
+    // on the request handler pool: this slot used to make unbounded blocking calls
+    // (plus one blocking ClipActor construction per selected item) on the GUI
+    // thread, which froze the UI for large selections.
+    const auto selection_actor = pending_selection_actor_;
+    const auto playlist_actor  = pending_playlist_actor_;
+
+    if (not selection_actor or not playlist_actor)
+        return;
+
+    if (current_playlist_index_.isValid()) {
+        const auto type = StdFromQString(current_playlist_index_.data(typeRole).toString());
+        if (type != "Playlist" and type != "Subset")
+            return;
+    }
+
+    QtConcurrent::run(request_handler_, [this, selection_actor, playlist_actor]() {
+        std::vector<caf::actor> spawned;
+
+        try {
+            scoped_actor sys{system()};
+
+            // Ask for the authoritative selection rather than replaying the delta
+            // that was captured when the debounce was armed - by now the backend
+            // has applied it, and the user may have added to it several times.
+            auto selected = request_receive_wait<utility::UuidList>(
+                *sys,
+                selection_actor,
+                k_synthesis_timeout,
+                playhead::get_selection_atom_v);
+
+            if (selected.empty()) {
+                // Nothing selected: leave the viewport showing whatever it has.
+                return;
+            }
+
+            auto all_media = request_receive_wait<utility::UuidActorVector>(
+                *sys, playlist_actor, k_synthesis_timeout, playlist::get_media_atom_v);
+
+            utility::UuidListContainer playlist_media;
+            std::map<utility::Uuid, utility::UuidActor> media_by_uuid;
+            for (const auto &m : all_media) {
+                playlist_media.insert(m.uuid());
+                media_by_uuid[m.uuid()] = m;
+            }
+
+            const utility::UuidSet selection(selected.begin(), selected.end());
+            auto transient_timeline =
+                timeline::TransientSelectionTimeline::synthesize(playlist_media, selection);
+
+            if (transient_timeline.media().empty()) {
+                // The selection belongs to a different playlist than the one we
+                // read media from, or every selected item has since been removed.
+                return;
+            }
+
+            auto tactor = system().spawn<timeline::TimelineActor>(
+                "Transient Sequence",
+                utility::FrameRate(timebase::k_flicks_24fps),
+                transient_timeline.uuid(),
+                playlist_actor,
+                true // with_tracks
+            );
+            spawned.push_back(tactor);
+
+            auto new_item = request_receive_wait<timeline::Item>(
+                *sys, tactor, k_synthesis_timeout, timeline::item_atom_v);
+
+            // The root item's first child is the Stack, whose first child is the
+            // Video Track.
+            auto stack_opt = new_item.item_at_index(0);
+            if (not stack_opt)
+                throw std::runtime_error("transient sequence has no stack");
+            if (auto stack_actor = caf::actor_cast<caf::actor>((*stack_opt)->actor_addr()))
+                spawned.push_back(stack_actor);
+
+            auto track_opt = (*stack_opt)->item_at_index(0);
+            if (not track_opt)
+                throw std::runtime_error("transient sequence has no video track");
+            auto track_actor = caf::actor_cast<caf::actor>((*track_opt)->actor_addr());
+            if (not track_actor)
+                throw std::runtime_error("transient sequence video track is invalid");
+            spawned.push_back(track_actor);
+
+            for (const auto &muuid : transient_timeline.media()) {
+                auto mit = media_by_uuid.find(muuid);
+                if (mit == std::end(media_by_uuid))
+                    continue;
+
+                // Register the media in the timeline's pool BEFORE inserting the
+                // clip that refers to it. These are different actors, so the two
+                // messages have no ordering guarantee between them and have to be
+                // sequenced explicitly.
+                std::ignore = request_receive_wait<utility::UuidActor>(
+                    *sys,
+                    tactor,
+                    k_synthesis_timeout,
+                    playlist::add_media_atom_v,
+                    mit->second,
+                    utility::Uuid());
+
+                auto clip_uuid  = utility::Uuid::generate();
+                auto clip_actor = system().spawn<timeline::ClipActor>(
+                    mit->second, "Clip", clip_uuid);
+                spawned.push_back(clip_actor);
+
+                std::ignore = request_receive_wait<utility::JsonStore>(
+                    *sys,
+                    track_actor,
+                    k_synthesis_timeout,
+                    timeline::insert_item_atom_v,
+                    -1,
+                    utility::UuidActorVector({utility::UuidActor(clip_uuid, clip_actor)}));
+            }
+
+            // Bind the viewport only once the sequence is fully populated,
+            // otherwise the session can build a playhead over an empty timeline.
+            anon_mail(
+                session::viewport_active_media_container_atom_v,
+                utility::UuidActor(transient_timeline.uuid(), tactor))
+                .send(session_actor_);
+
+            // Hand ownership to the GUI thread, which retires the previous
+            // sequence. Cleared first so the error path below cannot also exit it.
+            auto adopted = spawned;
+            spawned.clear();
+            QMetaObject::invokeMethod(
+                this,
+                [this, adopted]() { adoptTransientSequence(adopted); },
+                Qt::QueuedConnection);
+
+            spdlog::debug(
+                "SessionModel::debouncedSelectionChanged - bound transient sequence of {} "
+                "clips to viewport.",
+                transient_timeline.media().size());
+
+        } catch (const std::exception &err) {
+            spdlog::warn("SessionModel::debouncedSelectionChanged failed: {}", err.what());
+        }
+
+        // Anything spawned but not adopted (any failure above) must not be left
+        // running - it is unreachable and holds MediaActor references.
+        exit_actors(system(), spawned);
+    });
 }
 
 void SessionModel::updateMediaListFilterString(

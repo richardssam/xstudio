@@ -261,9 +261,26 @@ void SessionModel::updateViewportCurrentMediaContainerIndexFromBackend() {
 
         if (!r.isValid() && playlist) {
             // we didn't find the actor in the model ... this could be that the model is
-            // still building so re-try in 250ms
-            QTimer::singleShot(
-                250, this, SLOT(updateViewportCurrentMediaContainerIndexFromBackend()));
+            // still building so re-try in 250ms.
+            //
+            // Bounded, because not every container the viewport can be bound to has a
+            // node in the session model - a transient bin sequence does not. Re-arming
+            // unconditionally spun forever, each tick doing a blocking backend call and
+            // a recursive model walk on the GUI thread.
+            static constexpr int max_retries = 20; // ~5 seconds
+            if (viewport_container_retries_ < max_retries) {
+                viewport_container_retries_++;
+                QTimer::singleShot(
+                    250, this, SLOT(updateViewportCurrentMediaContainerIndexFromBackend()));
+            } else {
+                spdlog::debug(
+                    "{} gave up locating viewport media container in the session model "
+                    "after {} retries",
+                    __PRETTY_FUNCTION__,
+                    max_retries);
+            }
+        } else {
+            viewport_container_retries_ = 0;
         }
 
         if (r != current_playhead_owner_index_) {

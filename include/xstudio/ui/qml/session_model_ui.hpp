@@ -16,6 +16,7 @@ CAF_PUSH_WARNINGS
 #include <QThreadPool>
 #include <QFutureWatcher>
 #include <QtConcurrent>
+#include <QTimer>
 CAF_POP_WARNINGS
 
 // namespace xstudio::timeline {
@@ -506,6 +507,13 @@ class SESSION_QML_EXPORT SessionModel : public caf::mixin::actor_object<JSONTree
 
   public slots:
     void updateMedia();
+    void debouncedSelectionChanged();
+
+  public:
+    // Takes ownership of a freshly built transient sequence and tears down the
+    // one it replaces. Must run on the GUI thread (it touches model members);
+    // debouncedSelectionChanged marshals it back with a queued invocation.
+    void adoptTransientSequence(const std::vector<caf::actor> &actors);
 
   signals:
 
@@ -665,6 +673,27 @@ class SESSION_QML_EXPORT SessionModel : public caf::mixin::actor_object<JSONTree
     QPersistentModelIndex mediaStatusIndex_;
     QPersistentModelIndex current_playlist_index_;
     QPersistentModelIndex current_playhead_owner_index_;
+
+    QTimer *selection_debounce_timer_{nullptr};
+
+    // Captured when the debounce is armed, so the synthesis works from a
+    // consistent snapshot of WHICH playlist changed. The selection itself is
+    // deliberately not cached: the vector handed to updateSelection is only a
+    // delta for SM_SELECT/SM_DESELECT/SM_TOGGLE, so it is re-queried from
+    // pending_selection_actor_ when the timer fires.
+    caf::actor pending_selection_actor_;
+    caf::actor pending_playlist_actor_;
+
+    // Every actor spawned for the transient sequence currently bound to the
+    // viewport. The timeline does not link its stack/tracks/clips (TrackActor
+    // only monitors them, see TrackActor::add_item), so exiting the timeline
+    // alone would not reclaim them - they are tracked and exited explicitly
+    // when the next sequence replaces this one.
+    std::vector<caf::actor> transient_sequence_actors_;
+
+    // Bounds the retry in updateViewportCurrentMediaContainerIndexFromBackend so
+    // a container that never appears in the model cannot re-arm it forever.
+    int viewport_container_retries_{0};
 
     QMap<QString, QImage> media_thumbnails_; // key is actor string
     utility::UuidSet processed_events_;
