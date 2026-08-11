@@ -77,7 +77,11 @@ SessionModel::SessionModel(QObject *parent) : super(parent) {
     selection_debounce_timer_ = new QTimer(this);
     selection_debounce_timer_->setSingleShot(true);
     selection_debounce_timer_->setInterval(150);
-    connect(selection_debounce_timer_, &QTimer::timeout, this, &SessionModel::debouncedSelectionChanged);
+    connect(
+        selection_debounce_timer_,
+        &QTimer::timeout,
+        this,
+        &SessionModel::debouncedSelectionChanged);
 }
 
 void SessionModel::fetchMore(const QModelIndex &parent) {

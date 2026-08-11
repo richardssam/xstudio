@@ -1347,7 +1347,7 @@ constexpr auto k_synthesis_timeout = std::chrono::seconds(5);
 } // namespace
 
 void SessionModel::adoptTransientSequence(const std::vector<caf::actor> &actors) {
-    auto previous = transient_sequence_actors_;
+    auto previous              = transient_sequence_actors_;
     transient_sequence_actors_ = actors;
     exit_actors(system(), previous);
 }
@@ -1379,10 +1379,7 @@ void SessionModel::debouncedSelectionChanged() {
             // that was captured when the debounce was armed - by now the backend
             // has applied it, and the user may have added to it several times.
             auto selected = request_receive_wait<utility::UuidList>(
-                *sys,
-                selection_actor,
-                k_synthesis_timeout,
-                playhead::get_selection_atom_v);
+                *sys, selection_actor, k_synthesis_timeout, playhead::get_selection_atom_v);
 
             if (selected.empty()) {
                 // Nothing selected: leave the viewport showing whatever it has.
@@ -1454,9 +1451,9 @@ void SessionModel::debouncedSelectionChanged() {
                     mit->second,
                     utility::Uuid());
 
-                auto clip_uuid  = utility::Uuid::generate();
-                auto clip_actor = system().spawn<timeline::ClipActor>(
-                    mit->second, "Clip", clip_uuid);
+                auto clip_uuid = utility::Uuid::generate();
+                auto clip_actor =
+                    system().spawn<timeline::ClipActor>(mit->second, "Clip", clip_uuid);
                 spawned.push_back(clip_actor);
 
                 std::ignore = request_receive_wait<utility::JsonStore>(

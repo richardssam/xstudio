@@ -9,7 +9,7 @@ namespace xstudio::timeline {
 
 class TransientSelectionTimeline {
   public:
-    TransientSelectionTimeline() = default;
+    TransientSelectionTimeline()  = default;
     ~TransientSelectionTimeline() = default;
 
     // Synthesizes a new Timeline object based on the source playlist and current
@@ -20,8 +20,7 @@ class TransientSelectionTimeline {
     // alone: synthesizing the entire playlist here meant that merely clearing the
     // selection force-bound the viewport to a sequence of every item in the bin.
     [[nodiscard]] static Timeline synthesize(
-        const utility::UuidListContainer &playlist_media,
-        const utility::UuidSet &selection) {
+        const utility::UuidListContainer &playlist_media, const utility::UuidSet &selection) {
 
         Timeline t("Transient Selection");
         for (const auto &m : playlist_media.uuids()) {
