@@ -17,11 +17,19 @@ using namespace xstudio::utility;
 
 ACTOR_TEST_SETUP()
 
+// An absolute path prefix that is absolute on the platform under test.
+// '/file.mov' is drive-less on Windows, so it is not one there.
+#ifdef _WIN32
+#define ABS_ "C:/"
+#else
+#define ABS_ "/"
+#endif
+
 
 TEST(HelpersTest, Test) {
     FrameList fl;
 
-    EXPECT_EQ(posix_path_to_uri("/file.mov", true), parse_cli_posix_path("/file.mov", fl));
+    EXPECT_EQ(posix_path_to_uri(ABS_ "file.mov", true), parse_cli_posix_path(ABS_ "file.mov", fl));
 
     EXPECT_EQ(to_string(posix_path_to_uri("file.exr")), "file:file.exr");
 
@@ -35,33 +43,33 @@ TEST(HelpersTest, Test) {
         << "Should be exception";
 
     EXPECT_EQ(
-        posix_path_to_uri("/file.{:04d}.exr", true),
-        parse_cli_posix_path("/file.{:04d}.exr=1-10", fl));
+        posix_path_to_uri(ABS_ "file.{:04d}.exr", true),
+        parse_cli_posix_path(ABS_ "file.{:04d}.exr=1-10", fl));
     EXPECT_EQ("1-10", to_string(fl));
 
     EXPECT_EQ(
-        posix_path_to_uri("/file.{:04d}.exr", true),
-        parse_cli_posix_path("/file.1-10{:04d}.exr", fl));
+        posix_path_to_uri(ABS_ "file.{:04d}.exr", true),
+        parse_cli_posix_path(ABS_ "file.1-10{:04d}.exr", fl));
     EXPECT_EQ("1-10", to_string(fl));
 
     EXPECT_EQ(
-        posix_path_to_uri("/file.{:04d}.exr", true),
-        parse_cli_posix_path("/file.1-10#.exr", fl));
+        posix_path_to_uri(ABS_ "file.{:04d}.exr", true),
+        parse_cli_posix_path(ABS_ "file.1-10#.exr", fl));
     EXPECT_EQ("1-10", to_string(fl));
 
     EXPECT_EQ(
-        posix_path_to_uri("/file.{:04d}.exr", true),
-        parse_cli_posix_path("/file.@@@@.exr=1-10", fl));
+        posix_path_to_uri(ABS_ "file.{:04d}.exr", true),
+        parse_cli_posix_path(ABS_ "file.@@@@.exr=1-10", fl));
     EXPECT_EQ("1-10", to_string(fl));
 
     EXPECT_EQ(
-        posix_path_to_uri("/file.{:04d}.exr", true),
-        parse_cli_posix_path("/file.#.exr=1-10", fl));
+        posix_path_to_uri(ABS_ "file.{:04d}.exr", true),
+        parse_cli_posix_path(ABS_ "file.#.exr=1-10", fl));
     EXPECT_EQ("1-10", to_string(fl));
 
     EXPECT_EQ(
-        posix_path_to_uri("/file.{:03d}.exr", true),
-        parse_cli_posix_path("/file.###.exr=1-10", fl));
+        posix_path_to_uri(ABS_ "file.{:03d}.exr", true),
+        parse_cli_posix_path(ABS_ "file.###.exr=1-10", fl));
     EXPECT_EQ("1-10", to_string(fl));
 
     EXPECT_EQ(
@@ -87,7 +95,17 @@ TEST(HelpersTest, Test) {
 
 
 TEST(Helpers2Test, Test) {
+#ifdef _WIN32
+    // There is no HOME on Windows - getenv returns null and constructing a
+    // std::string from it is undefined. expand_envvars resolves ${HOME}
+    // through ${USERPROFILE} there, so that is what it should come back as.
+    EXPECT_EQ(expand_envvars("${HOME}"), std::getenv("USERPROFILE"));
+    EXPECT_EQ(
+        " " + expand_envvars("${HOME}") + " ",
+        std::string(" ") + std::getenv("USERPROFILE") + " ");
+#else
     EXPECT_EQ(expand_envvars("${HOME}"), std::getenv("HOME"));
     EXPECT_EQ(
         " " + expand_envvars("${HOME}") + " ", std::string(" ") + std::getenv("HOME") + " ");
+#endif
 }
