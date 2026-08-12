@@ -317,11 +317,9 @@ std::string xstudio::utility::uri_to_posix_path(const caf::uri &uri, const bool 
     if (uri.path().data()) {
         std::string path = uri_decode(uri.path().data());
         // spdlog::warn("{} {}",uri.path().data(), path);
-#ifdef __linux__
         if (not path.empty() and path[0] != '/' and not uri.authority().empty()) {
             path = "/" + path;
         }
-#endif
 
 #ifdef _WIN32
 

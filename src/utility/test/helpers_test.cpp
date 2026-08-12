@@ -158,11 +158,7 @@ TEST(UriToPosixPathSchemeTest, WebUrisDoNotBecomeHostPaths) {
     // downstream should hand this to the filesystem, but is_file_supported()
     // and media_actor both read the extension off it to pick a reader, so it
     // cannot simply be empty.
-#ifdef _WIN32
-    EXPECT_EQ(uri_to_posix_path(uri_of("https://host.example.com/a/b.mp4")), "a/b.mp4");
-#else
     EXPECT_EQ(uri_to_posix_path(uri_of("https://host.example.com/a/b.mp4")), "/a/b.mp4");
-#endif
 }
 
 TEST(UriToPosixPathSchemeTest, FileUrisKeepTheirPathSemantics) {
