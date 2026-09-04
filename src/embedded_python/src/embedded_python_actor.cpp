@@ -272,6 +272,7 @@ void EmbeddedPythonActor::main_loop() {
                 try {
                     PyStdErrOutStreamRedirect out;
                     try {
+                        base_.setup();
                         if (actor) {
                             // spdlog::warn("connect actor 2");
                             result = base_.connect(actor);
