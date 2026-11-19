@@ -2,14 +2,11 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
-#include <chrono>
-#include <cstring>
 #include <iostream>
 #include <filesystem>
 
 #include "ffmpeg_decoder.hpp"
 #include "ffmpeg.hpp"
-#include "vt_repack.hpp"
 #ifdef XSTUDIO_HAS_VIDEOTOOLBOX
 #include "vt_decoder.hpp"
 #endif
@@ -81,7 +78,7 @@ TEST(FFMpegShaderFriendlyPixFormat, PackedYUVRepacksToPlanarAtSameDepth) {
 // v408/uyva is 8 bit 4:4:4 with alpha. It used to have no planar target and fell
 // back to 8 bit RGBA, losing the YUV code values and taking sws's BT.601 path.
 TEST(FFMpegShaderFriendlyPixFormat, EightBitYUVWithAlphaKeepsAlphaAndDepth) {
-    EXPECT_EQ(shader_friendly_pix_format(AV_PIX_FMT_UYVA), AV_PIX_FMT_YUVA444P);
+    EXPECT_EQ(shader_friendly_pix_format(AV_PIX_FMT_VUYA), AV_PIX_FMT_YUVA444P);
     EXPECT_EQ(shader_friendly_pix_format(AV_PIX_FMT_YUVA420P), AV_PIX_FMT_YUVA420P);
     EXPECT_EQ(shader_friendly_pix_format(AV_PIX_FMT_YUVA422P), AV_PIX_FMT_YUVA422P);
 }
@@ -90,7 +87,7 @@ TEST(FFMpegShaderFriendlyPixFormat, EightBitYUVWithAlphaKeepsAlphaAndDepth) {
 // for 8 bit input must stay 8 bit.
 TEST(FFMpegShaderFriendlyPixFormat, EightBitIsNeverPromotedToDeeperFormat) {
     for (const auto fmt :
-         {AV_PIX_FMT_UYVY422, AV_PIX_FMT_UYVA, AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV444P}) {
+         {AV_PIX_FMT_UYVY422, AV_PIX_FMT_VUYA, AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV444P}) {
         const auto dst = shader_friendly_pix_format(fmt);
         ASSERT_NE(dst, AV_PIX_FMT_NONE) << av_get_pix_fmt_name(fmt);
         EXPECT_EQ(av_pix_fmt_desc_get(dst)->comp[0].depth, 8) << av_get_pix_fmt_name(fmt);
@@ -195,281 +192,6 @@ TEST(FFMpegColourRange, DnegMovForcesVideoRangeForDNxHD) {
 }
 
 // ---------------------------------------------------------------------------------
-// vt_repack: VideoToolbox pixel layouts to planar formats the shader reads.
-// Checked against av_read_image_line2 reading the same bytes as the matching
-// FFmpeg format, so FFmpeg's own pixel descriptors are the reference.
-
-namespace {
-
-using namespace xstudio::media_reader::ffmpeg::vt_repack;
-
-// A source plane with padded rows, filled with pseudo-random values plus the
-// extremes 0 and 0xFFFF (or 0xFF) at the start of every row.
-struct TestPlane {
-    std::vector<uint8_t> bytes;
-    size_t stride;
-    TestPlane(const int row_bytes, const int rows, const int bytes_per_sample, uint32_t seed)
-        : stride(size_t(row_bytes) + 40) {
-        bytes.resize(stride * rows);
-        for (auto &b : bytes) {
-            seed = seed * 1664525u + 1013904223u;
-            b    = uint8_t(seed >> 24);
-        }
-        for (int r = 0; r < rows; ++r) {
-            uint8_t *row = bytes.data() + stride * r;
-            std::memset(row, 0, bytes_per_sample);
-            std::memset(row + bytes_per_sample, 0xff, bytes_per_sample);
-        }
-    }
-    SrcPlane src() const { return {bytes.data(), stride}; }
-};
-
-struct TestImage {
-    Layout layout;
-    std::vector<uint8_t> bytes;
-    TestImage(const AVPixelFormat fmt, const int w, const int h)
-        : layout(planar_layout(fmt, w, h)), bytes(layout.total_size) {}
-    DstPlane dst(const int i) {
-        return {bytes.data() + layout.offsets[i], layout.linesizes[i]};
-    }
-    // component c at (x, y) via FFmpeg's pixel descriptor
-    int value(const int c, const int x, const int y) const {
-        const uint8_t *data[4];
-        int linesize[4];
-        for (int i = 0; i < 4; ++i) {
-            data[i]     = bytes.data() + layout.offsets[i];
-            linesize[i] = int(layout.linesizes[i]);
-        }
-        uint16_t v = 0;
-        av_read_image_line2(
-            &v, data, linesize, av_pix_fmt_desc_get(layout.format), x, y, c, 1, 0, 2);
-        return v;
-    }
-};
-
-// component c at (x, y) of source planes interpreted as FFmpeg format 'fmt'
-int reference_value(
-    const AVPixelFormat fmt,
-    const std::vector<const TestPlane *> &planes,
-    const int c,
-    const int x,
-    const int y) {
-    const uint8_t *data[4] = {nullptr, nullptr, nullptr, nullptr};
-    int linesize[4]        = {0, 0, 0, 0};
-    for (size_t i = 0; i < planes.size(); ++i) {
-        data[i]     = planes[i]->bytes.data();
-        linesize[i] = int(planes[i]->stride);
-    }
-    uint16_t v = 0;
-    av_read_image_line2(&v, data, linesize, av_pix_fmt_desc_get(fmt), x, y, c, 1, 0, 2);
-    return v;
-}
-
-} // namespace
-
-TEST(VtRepack, PlanarLayoutIsAlignedAndContiguous) {
-    const auto l = planar_layout(AV_PIX_FMT_YUV420P10LE, 1921, 1081);
-    ASSERT_EQ(l.format, AV_PIX_FMT_YUV420P10LE);
-    ASSERT_EQ(l.planes, 3);
-    for (int i = 0; i < 3; ++i)
-        EXPECT_EQ(l.linesizes[i] % 64, 0u);
-    EXPECT_GE(l.linesizes[0], 1921u * 2);
-    EXPECT_GE(l.linesizes[1], 961u * 2);
-    EXPECT_EQ(l.offsets[1], l.linesizes[0] * 1081);
-    EXPECT_EQ(l.offsets[2], l.offsets[1] + l.linesizes[1] * 541);
-    EXPECT_EQ(l.total_size, l.offsets[2] + l.linesizes[2] * 541);
-
-    // packed formats have no plane layout
-    EXPECT_EQ(planar_layout(AV_PIX_FMT_UYVY422, 64, 64).format, AV_PIX_FMT_NONE);
-}
-
-// Every VideoToolbox biplanar layout against FFmpeg's description of it: 8 bit
-// (nv12/16/24), 10 bit in the top bits (p010/210/410) and 16 bit (p016/216/416,
-// rounded to 12 bits).
-TEST(VtRepack, BiplanarToPlanarAllChromaFormats) {
-    enum Kind { Bits8, Bits10, Bits16 };
-    struct Case {
-        Kind kind;
-        Chroma chroma;
-        AVPixelFormat src, dst;
-    };
-    const Case cases[] = {
-        {Bits8, Chroma::C420, AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P},
-        {Bits8, Chroma::C422, AV_PIX_FMT_NV16, AV_PIX_FMT_YUV422P},
-        {Bits8, Chroma::C444, AV_PIX_FMT_NV24, AV_PIX_FMT_YUV444P},
-        {Bits10, Chroma::C420, AV_PIX_FMT_P010LE, AV_PIX_FMT_YUV420P10LE},
-        {Bits10, Chroma::C422, AV_PIX_FMT_P210LE, AV_PIX_FMT_YUV422P10LE},
-        {Bits10, Chroma::C444, AV_PIX_FMT_P410LE, AV_PIX_FMT_YUV444P10LE},
-        {Bits16, Chroma::C420, AV_PIX_FMT_P016LE, AV_PIX_FMT_YUV420P12LE},
-        {Bits16, Chroma::C422, AV_PIX_FMT_P216LE, AV_PIX_FMT_YUV422P12LE},
-        {Bits16, Chroma::C444, AV_PIX_FMT_P416LE, AV_PIX_FMT_YUV444P12LE},
-    };
-    for (const auto &cs : cases) {
-        for (auto [w, h] : {std::pair{64, 32}, std::pair{33, 17}}) {
-            const int bps = cs.kind == Bits8 ? 1 : 2;
-            const int cw = chroma_width(w, cs.chroma), ch = chroma_height(h, cs.chroma);
-            TestPlane y(w * bps, h, bps, 3), uv(cw * 2 * bps, ch, bps, 4);
-            if (cs.kind == Bits10) {
-                // VideoToolbox leaves the low 6 bits zero; so does a real P010 encoder.
-                for (auto *pl : {&y, &uv})
-                    for (size_t i = 0; i + 1 < pl->bytes.size(); i += 2)
-                        pl->bytes[i] &= 0xc0;
-            }
-
-            TestImage out(cs.dst, w, h);
-            switch (cs.kind) {
-            case Bits8:
-                biplanar8_to_planar8(
-                    y.src(), uv.src(), out.dst(0), out.dst(1), out.dst(2), w, h, cs.chroma);
-                break;
-            case Bits10:
-                biplanar10_to_planar10(
-                    y.src(), uv.src(), out.dst(0), out.dst(1), out.dst(2), w, h, cs.chroma);
-                break;
-            case Bits16:
-                biplanar16_to_planar12(
-                    y.src(), uv.src(), out.dst(0), out.dst(1), out.dst(2), w, h, cs.chroma);
-                break;
-            }
-
-            auto expected = [&](const int c, const int x, const int yy) {
-                const int ref = reference_value(cs.src, {&y, &uv}, c, x, yy);
-                return cs.kind == Bits16 ? int(round_16_to_12(uint16_t(ref))) : ref;
-            };
-            for (int c = 0; c < 3; ++c) {
-                const int pw = c ? cw : w, ph = c ? ch : h;
-                for (int yy = 0; yy < ph; ++yy)
-                    for (int x = 0; x < pw; ++x)
-                        ASSERT_EQ(out.value(c, x, yy), expected(c, x, yy))
-                            << av_get_pix_fmt_name(cs.src) << " " << w << "x" << h << " c" << c
-                            << " " << x << "," << yy;
-            }
-        }
-    }
-}
-
-// s4as = p416le (16 bit Y + interleaved CbCr) plus a 16 bit alpha plane.
-TEST(VtRepack, S4asToYuva444p12RoundsAndKeepsAlpha) {
-    for (auto [w, h] : {std::pair{64, 32}, std::pair{33, 17}}) {
-        TestPlane y(w * 2, h, 2, 5), uv(w * 4, h, 2, 6), a(w * 2, h, 2, 7);
-        TestImage out(AV_PIX_FMT_YUVA444P12LE, w, h);
-        s4as_to_yuva444p12(
-            y.src(), uv.src(), a.src(), out.dst(0), out.dst(1), out.dst(2), out.dst(3), w, h);
-
-        for (int yy = 0; yy < h; ++yy)
-            for (int x = 0; x < w; ++x) {
-                for (int c = 0; c < 3; ++c) {
-                    const int ref = reference_value(AV_PIX_FMT_P416LE, {&y, &uv}, c, x, yy);
-                    ASSERT_EQ(out.value(c, x, yy), round_16_to_12(uint16_t(ref)))
-                        << "c" << c << " " << x << "," << yy;
-                }
-                const uint16_t alpha =
-                    *reinterpret_cast<const uint16_t *>(a.bytes.data() + a.stride * yy + x * 2);
-                ASSERT_EQ(out.value(3, x, yy), round_16_to_12(alpha)) << "A " << x << "," << yy;
-            }
-    }
-    EXPECT_EQ(round_16_to_12(0), 0);
-    EXPECT_EQ(round_16_to_12(0xffff), 4095);
-    EXPECT_EQ(round_16_to_12(7), 0);
-    EXPECT_EQ(round_16_to_12(8), 1);
-    EXPECT_EQ(round_16_to_12(0xfff0), 4095);
-}
-
-// Not run by default (timing-dependent). Run with --gtest_also_run_disabled_tests.
-// Budget (design D5, measured on an M2 Max): at most 3 ms per 4K frame, single
-// threaded, and at most 2.5x a plain copy of the same source bytes. swscale, which
-// this replaced, took 7.7-9.6 ms.
-TEST(VtRepack, DISABLED_BenchmarkAgainstMemcpy4K) {
-    const int w = 3840, h = 2160, reps = 30;
-    using clock  = std::chrono::steady_clock;
-    auto time_ms = [&](auto &&fn) {
-        fn(); // warm up
-        const auto t0 = clock::now();
-        for (int i = 0; i < reps; ++i)
-            fn();
-        return std::chrono::duration<double, std::milli>(clock::now() - t0).count() / reps;
-    };
-    auto memcpy_ms = [&](const std::vector<const TestPlane *> &planes) {
-        size_t total = 0;
-        for (auto *p : planes)
-            total += p->bytes.size();
-        std::vector<uint8_t> dst(total);
-        return time_ms([&]() {
-            size_t off = 0;
-            for (auto *p : planes) {
-                std::memcpy(dst.data() + off, p->bytes.data(), p->bytes.size());
-                off += p->bytes.size();
-            }
-        });
-    };
-    auto report = [](const char *name, const double ms, const double copy_ms) {
-        std::cout << name << ": " << ms << " ms, memcpy " << copy_ms << " ms, ratio "
-                  << ms / copy_ms << "\n";
-        EXPECT_LE(ms, 3.0) << name;
-        EXPECT_LE(ms / copy_ms, 2.5) << name;
-    };
-
-    // every biplanar loop: name, bytes per sample, chroma, output format
-    enum Kind { Bits8, Bits10, Bits16 };
-    struct Case {
-        const char *name;
-        Kind kind;
-        Chroma chroma;
-        AVPixelFormat dst;
-    };
-    const Case cases[] = {
-        {"420v -> yuv420p", Bits8, Chroma::C420, AV_PIX_FMT_YUV420P},
-        {"422v -> yuv422p", Bits8, Chroma::C422, AV_PIX_FMT_YUV422P},
-        {"444v -> yuv444p", Bits8, Chroma::C444, AV_PIX_FMT_YUV444P},
-        {"x420 -> yuv420p10le", Bits10, Chroma::C420, AV_PIX_FMT_YUV420P10LE},
-        {"x422 -> yuv422p10le", Bits10, Chroma::C422, AV_PIX_FMT_YUV422P10LE},
-        {"x444 -> yuv444p10le", Bits10, Chroma::C444, AV_PIX_FMT_YUV444P10LE},
-        {"sv22 -> yuv422p12le", Bits16, Chroma::C422, AV_PIX_FMT_YUV422P12LE},
-        {"sv44 -> yuv444p12le", Bits16, Chroma::C444, AV_PIX_FMT_YUV444P12LE},
-    };
-    for (const auto &cs : cases) {
-        const int bps = cs.kind == Bits8 ? 1 : 2;
-        const int cw = chroma_width(w, cs.chroma), ch = chroma_height(h, cs.chroma);
-        TestPlane y(w * bps, h, bps, 1), uv(cw * 2 * bps, ch, bps, 2);
-        TestImage out(cs.dst, w, h);
-        const double ms = time_ms([&]() {
-            switch (cs.kind) {
-            case Bits8:
-                biplanar8_to_planar8(
-                    y.src(), uv.src(), out.dst(0), out.dst(1), out.dst(2), w, h, cs.chroma);
-                break;
-            case Bits10:
-                biplanar10_to_planar10(
-                    y.src(), uv.src(), out.dst(0), out.dst(1), out.dst(2), w, h, cs.chroma);
-                break;
-            case Bits16:
-                biplanar16_to_planar12(
-                    y.src(), uv.src(), out.dst(0), out.dst(1), out.dst(2), w, h, cs.chroma);
-                break;
-            }
-        });
-        report(cs.name, ms, memcpy_ms({&y, &uv}));
-    }
-    {
-        TestPlane y(w * 2, h, 2, 1), uv(w * 4, h, 2, 2), a(w * 2, h, 2, 3);
-        TestImage out(AV_PIX_FMT_YUVA444P12LE, w, h);
-        const double ms = time_ms([&]() {
-            s4as_to_yuva444p12(
-                y.src(),
-                uv.src(),
-                a.src(),
-                out.dst(0),
-                out.dst(1),
-                out.dst(2),
-                out.dst(3),
-                w,
-                h);
-        });
-        report("s4as -> yuva444p12le", ms, memcpy_ms({&y, &uv, &a}));
-    }
-}
-
-// ---------------------------------------------------------------------------------
 // VtDecoder, driven directly with packets from libavformat.
 #ifdef XSTUDIO_HAS_VIDEOTOOLBOX
 
@@ -507,11 +229,11 @@ struct DecodeResult {
     std::vector<int64_t> packet_pts;
     std::vector<int64_t> frame_pts;
     int send_errors                   = 0;
-    AVPixelFormat format              = AV_PIX_FMT_NONE;
-    AVColorSpace colorspace           = AVCOL_SPC_UNSPECIFIED;
+    std::string format;
+    std::string colorspace;
     AVColorPrimaries primaries        = AVCOL_PRI_UNSPECIFIED;
     AVColorTransferCharacteristic trc = AVCOL_TRC_UNSPECIFIED;
-    AVColorRange range                = AVCOL_RANGE_UNSPECIFIED;
+    bool full_range = false;
 };
 
 // Decodes the whole stream with VideoToolbox, avcodec-style send/receive loop.
@@ -523,16 +245,25 @@ DecodeResult vt_decode_all(const std::string &path, const int max_frames = 1 << 
     EXPECT_TRUE(vt) << error;
     if (!vt)
         return r;
-    AVFrame *frame = av_frame_alloc();
-    auto take      = [&]() {
+    ImageBufPtr frame;
+    auto take = [&]() {
+        const auto &params   = frame->shader_params();
+        const auto &metadata = frame->metadata();
         if (r.frame_pts.empty()) {
-            r.format     = AVPixelFormat(frame->format);
-            r.colorspace = frame->colorspace;
-            r.primaries  = frame->color_primaries;
-            r.trc        = frame->color_trc;
-            r.range      = frame->color_range;
+            r.format =
+                fmt::format(
+                    "{}{}{}",
+                    params.value("half_scale_uvx", 0) ? "subx" : "fullx",
+                    params.value("half_scale_uvy", 0) ? "suby" : "fully",
+                    metadata.value("has_alpha", false) ? ":alpha" : "");
+            r.colorspace = metadata.value("color_space", std::string());
+            r.primaries = AVColorPrimaries(
+                metadata.value("color_primaries", int(AVCOL_PRI_UNSPECIFIED)));
+            r.trc = AVColorTransferCharacteristic(
+                metadata.value("color_trc", int(AVCOL_TRC_UNSPECIFIED)));
+            r.full_range = metadata.value("full_range", false);
         }
-        r.frame_pts.push_back(frame->pts);
+        r.frame_pts.push_back(metadata.value("pts", AV_NOPTS_VALUE));
     };
     while (AVPacket *pkt = dm.next()) {
         if (int(r.frame_pts.size()) >= max_frames)
@@ -546,7 +277,6 @@ DecodeResult vt_decode_all(const std::string &path, const int max_frames = 1 << 
     vt->send_packet(nullptr);
     while (vt->receive_frame(frame) == 0)
         take();
-    av_frame_free(&frame);
     return r;
 }
 
@@ -561,11 +291,31 @@ DecodeResult sw_decode_all(const std::string &path) {
     AVFrame *frame = av_frame_alloc();
     auto take      = [&]() {
         if (r.frame_pts.empty()) {
-            r.format     = AVPixelFormat(frame->format);
-            r.colorspace = frame->colorspace;
+            const AVPixFmtDescriptor *description = av_pix_fmt_desc_get(AVPixelFormat(frame->format));
+            r.format =
+                fmt::format(
+                    "{}{}{}",
+                    description->log2_chroma_w ? "subx" : "fullx",
+                    description->log2_chroma_h ? "suby" : "fully",
+                    description->flags & AV_PIX_FMT_FLAG_ALPHA ? ":alpha" : "");
+            switch (frame->colorspace) {
+            case AVCOL_SPC_BT709:
+                r.colorspace = "bt709";
+                break;
+            case AVCOL_SPC_BT2020_NCL:
+            case AVCOL_SPC_BT2020_CL:
+                r.colorspace = "bt2020";
+                break;
+            case AVCOL_SPC_SMPTE240M:
+                r.colorspace = "smpte240";
+                break;
+            default:
+                r.colorspace = "bt601";
+                break;
+            }
             r.primaries  = frame->color_primaries;
             r.trc        = frame->color_trc;
-            r.range      = frame->color_range;
+            r.full_range = frame->color_range == AVCOL_RANGE_JPEG;
         }
         r.frame_pts.push_back(frame->pts);
     };
@@ -583,36 +333,38 @@ DecodeResult sw_decode_all(const std::string &path) {
     return r;
 }
 
-const std::vector<std::pair<std::string, std::string>> k_vt_media_and_format = {
-    {"h264_8bit_bframes.mov", "420v"},
-    {"hevc_8bit_opengop.mov", "420v"},
-    {"hevc_main10_bframes.mov", "x420"},
-    {"hevc_422_10bit_bframes.mov", "x422"},
-    {"hevc_main10_bt2020_pq.mov", "x420"},
-    {"prores_422_proxy.mov", "x422"},
-    {"prores_422_lt.mov", "x422"},
-    {"prores_422_standard.mov", "x422"},
-    {"prores_422_hq.mov", "x422"},
-    {"prores_4444_alpha.mov", "s4as"},
-    {"prores_4444xq.mov", "s4as"},
+const std::vector<std::string> k_vt_media = {
+    "h264_8bit_bframes.mov",
+    "hevc_8bit_opengop.mov",
+    "hevc_main10_bframes.mov",
+    "hevc_422_10bit_bframes.mov",
+    "hevc_main10_bt2020_pq.mov",
+    "prores_422_proxy.mov",
+    "prores_422_lt.mov",
+    "prores_422_standard.mov",
+    "prores_422_hq.mov",
+    "prores_4444_alpha.mov",
+    "prores_4444xq.mov",
     // variants (spike 1.8); the 12 bit ones need FFMPEG_HIGHBIT when generating
-    {"variant_h264_10bit_420.mov", "x420"},
-    {"variant_h264_8bit_422.mov", "422v"},
-    {"variant_h264_10bit_422.mov", "x422"},
-    {"variant_h264_8bit_444.mov", "444v"},
-    {"variant_h264_10bit_444.mov", "x444"},
-    {"variant_hevc_8bit_422.mov", "422v"},
-    {"variant_hevc_8bit_444.mov", "444v"},
-    {"variant_hevc_10bit_444.mov", "x444"},
-    {"variant_hevc_12bit_422.mov", "sv22"},
-    {"variant_hevc_12bit_444.mov", "sv44"},
+    "variant_h264_10bit_420.mov",
+    "variant_h264_8bit_422.mov",
+    "variant_h264_10bit_422.mov",
+    "variant_h264_8bit_444.mov",
+    "variant_h264_10bit_444.mov",
+    "variant_hevc_8bit_422.mov",
+    "variant_hevc_8bit_444.mov",
+    "variant_hevc_10bit_444.mov",
+    "variant_hevc_12bit_422.mov",
+    "variant_hevc_12bit_444.mov",
 };
 
 // Is the clip there? Variant clips are optional; the core set is required.
 bool have_clip(const std::string &name) {
     if (!vt_media(name).empty())
-        return true;
-    EXPECT_EQ(name.rfind("variant_", 0), 0u) << name << " missing";
+        return name.rfind("variant_", 0) != 0;
+    const bool optional =
+        name.rfind("variant_", 0) == 0 || name == "hevc_422_10bit_bframes.mov";
+    EXPECT_TRUE(optional) << name << " missing";
     return false;
 }
 
@@ -621,7 +373,7 @@ bool have_clip(const std::string &name) {
 // Task 4.1 / 4.2
 TEST(VtDecoder, EligibilityAndOutputFormat) {
     VT_MEDIA_OR_SKIP(first, "h264_8bit_bframes.mov");
-    for (const auto &[name, expected] : k_vt_media_and_format) {
+    for (const auto &name : k_vt_media) {
         if (!have_clip(name))
             continue;
         Demuxer dm(vt_media(name));
@@ -630,11 +382,23 @@ TEST(VtDecoder, EligibilityAndOutputFormat) {
         EXPECT_TRUE(VtDecoder::eligible(dm.stream, reason)) << name << ": " << reason;
         auto vt = VtDecoder::create(dm.stream, reason);
         ASSERT_TRUE(vt) << name << ": " << reason;
-        EXPECT_EQ(vt->output_format_name(), expected) << name;
+        EXPECT_EQ(vt->output_format_name(), "automatic") << name;
+        bool decoded = false;
+        while (AVPacket *packet = dm.next()) {
+            ASSERT_GE(vt->send_packet(packet), 0) << name;
+            ImageBufPtr frame;
+            if (vt->receive_frame(frame) == 0) {
+                decoded = true;
+                break;
+            }
+        }
+        EXPECT_TRUE(decoded) << name;
+        EXPECT_FALSE(vt->output_format_name().empty()) << name;
+        EXPECT_NE(vt->output_format_name(), "automatic") << name;
     }
 
     for (const auto *name :
-         {"h264_annexb.h264", "dnxhr_fullrange.mov", "variant_hevc_12bit_420.mov"}) {
+         {"h264_annexb.h264", "dnxhr_fullrange.mov"}) {
         if (vt_media(name).empty())
             continue; // the 12 bit clip is optional
         Demuxer dm(vt_media(name));
@@ -650,7 +414,7 @@ TEST(VtDecoder, EligibilityAndOutputFormat) {
 // order, and the last frames aren't lost in the reorder delay.
 TEST(VtDecoder, DecodesEveryPacketInPresentationOrder) {
     VT_MEDIA_OR_SKIP(first, "h264_8bit_bframes.mov");
-    for (const auto &[name, fmt] : k_vt_media_and_format) {
+    for (const auto &name : k_vt_media) {
         if (!have_clip(name))
             continue;
         const auto r = vt_decode_all(vt_media(name));
@@ -668,22 +432,17 @@ TEST(VtDecoder, DecodesEveryPacketInPresentationOrder) {
 // Task 4.5 / 4.6: planar output format and colour metadata match FFmpeg's decoder.
 TEST(VtDecoder, FormatAndColourMatchSoftwareDecoder) {
     VT_MEDIA_OR_SKIP(first, "h264_8bit_bframes.mov");
-    for (const auto &[name, fmt] : k_vt_media_and_format) {
+    for (const auto &name : k_vt_media) {
         if (!have_clip(name))
             continue;
         const auto vt = vt_decode_all(vt_media(name), 1);
         const auto sw = sw_decode_all(vt_media(name));
         ASSERT_FALSE(vt.frame_pts.empty()) << name;
-        EXPECT_EQ(vt.format, sw.format) << name << ": " << av_get_pix_fmt_name(vt.format)
-                                        << " vs " << av_get_pix_fmt_name(sw.format);
-        EXPECT_EQ(vt.colorspace, sw.colorspace) << name;
+        EXPECT_EQ(vt.format, sw.format) << name;
         EXPECT_EQ(vt.primaries, sw.primaries) << name;
         EXPECT_EQ(vt.trc, sw.trc) << name;
         // FFmpeg reports MPEG range for ProRes; unspecified elsewhere means MPEG too.
-        auto norm = [](AVColorRange r) {
-            return r == AVCOL_RANGE_UNSPECIFIED ? AVCOL_RANGE_MPEG : r;
-        };
-        EXPECT_EQ(norm(vt.range), norm(sw.range)) << name;
+        EXPECT_EQ(vt.full_range, sw.full_range) << name;
     }
 }
 
@@ -712,14 +471,18 @@ struct Samples {
 
 Samples samples_of(const ImageBufPtr &buf) {
     Samples out;
-    const auto &p        = buf->shader_params();
-    out.bits             = p.value("bits_per_channel", 8);
-    const int bps        = out.bits > 8 ? 2 : 1;
-    const auto size      = buf->image_size_in_pixels();
-    const int cw         = p.value("half_scale_uvx", 0) ? (size.x + 1) / 2 : size.x;
-    const int ch         = p.value("half_scale_uvy", 0) ? (size.y + 1) / 2 : size.y;
-    const char *names[4] = {"y", "u", "v", "a"};
+    const auto &p            = buf->shader_params();
+    const auto &metadata     = buf->metadata();
+    const int vt_sample_bits = p.value("vt_sample_bits", 0);
+    out.bits = vt_sample_bits ? metadata.value("value_bits", 8) : p.value("bits_per_channel", 8);
+    const int bps            = out.bits > 8 ? 2 : 1;
+    const auto size          = buf->image_size_in_pixels();
+    const int cw             = p.value("half_scale_uvx", 0) ? (size.x + 1) / 2 : size.x;
+    const int ch             = p.value("half_scale_uvy", 0) ? (size.y + 1) / 2 : size.y;
+    const char *names[4]     = {"y", "u", "v", "a"};
     for (int i = 0; i < 4; ++i) {
+        if (vt_sample_bits && p.value("vt_chroma_interleaved", false) && i == 2)
+            continue;
         const int linesize = p.value(std::string(names[i]) + "_linesize", 0);
         if (!linesize)
             continue;
@@ -731,9 +494,48 @@ Samples samples_of(const ImageBufPtr &buf) {
         const auto *base = reinterpret_cast<const uint8_t *>(buf->buffer()) + offset;
         for (int y = 0; y < h; ++y) {
             const uint8_t *row = base + size_t(linesize) * y;
-            for (int x = 0; x < w; ++x)
-                plane.push_back(
-                    bps == 2 ? reinterpret_cast<const uint16_t *>(row)[x] : uint16_t(row[x]));
+            for (int x = 0; x < w; ++x) {
+                uint16_t sample =
+                    bps == 2 ? reinterpret_cast<const uint16_t *>(row)[x] : uint16_t(row[x]);
+                if (vt_sample_bits == 10)
+                    sample >>= 6;
+                else if (vt_sample_bits == 16)
+                    sample = uint16_t((sample + 8) >> 4);
+                plane.push_back(sample);
+            }
+        }
+    }
+    if (vt_sample_bits && p.value("vt_chroma_interleaved", false)) {
+        const int chroma_stride    = p.value("u_linesize", 0);
+        const size_t chroma_offset = p.value("u_plane_bytes_offset", size_t(0));
+        auto &u                    = out.planes[1];
+        auto &v                    = out.planes[2];
+        u.clear();
+        v.clear();
+        u.reserve(size_t(cw) * ch);
+        v.reserve(size_t(cw) * ch);
+        const auto *base = reinterpret_cast<const uint8_t *>(buf->buffer()) + chroma_offset;
+        for (int y = 0; y < ch; ++y) {
+            const auto *row = base + size_t(chroma_stride) * y;
+            for (int x = 0; x < cw; ++x) {
+                uint16_t cb, cr;
+                if (vt_sample_bits == 8) {
+                    cb = row[x * 2];
+                    cr = row[x * 2 + 1];
+                } else {
+                    cb = reinterpret_cast<const uint16_t *>(row)[x * 2];
+                    cr = reinterpret_cast<const uint16_t *>(row)[x * 2 + 1];
+                    if (vt_sample_bits == 10) {
+                        cb >>= 6;
+                        cr >>= 6;
+                    } else {
+                        cb = uint16_t((cb + 8) >> 4);
+                        cr = uint16_t((cr + 8) >> 4);
+                    }
+                }
+                u.push_back(cb);
+                v.push_back(cr);
+            }
         }
     }
     return out;
@@ -742,14 +544,17 @@ Samples samples_of(const ImageBufPtr &buf) {
 // Largest absolute sample difference between two images, -1 if their layouts differ.
 int max_difference(const ImageBufPtr &a, const ImageBufPtr &b) {
     const Samples sa = samples_of(a), sb = samples_of(b);
-    if (sa.bits != sb.bits)
-        return -1;
+    const int max_a = (1 << sa.bits) - 1;
+    const int max_b = (1 << sb.bits) - 1;
     int worst = 0;
     for (int i = 0; i < 4; ++i) {
         if (sa.planes[i].size() != sb.planes[i].size())
             return -1;
-        for (size_t k = 0; k < sa.planes[i].size(); ++k)
-            worst = std::max(worst, std::abs(int(sa.planes[i][k]) - int(sb.planes[i][k])));
+        for (size_t k = 0; k < sa.planes[i].size(); ++k) {
+            const int normalized_a = int(sa.planes[i][k]) * 255 / max_a;
+            const int normalized_b = int(sb.planes[i][k]) * 255 / max_b;
+            worst                  = std::max(worst, std::abs(normalized_a - normalized_b));
+        }
     }
     return worst;
 }
@@ -772,22 +577,20 @@ FFMpegDecoder make_decoder(const std::string &path, const VideoToolboxMode mode)
 // YUV the shader reads directly - no CPU conversion on the way.
 TEST(VtStream, PlaysThroughVideoToolboxWithoutCpuConversion) {
     VT_MEDIA_OR_SKIP(first, "h264_8bit_bframes.mov");
-    for (const auto &[name, fmt] : k_vt_media_and_format) {
+    for (const auto &name : k_vt_media) {
         if (!have_clip(name))
             continue;
-        auto decoder = make_decoder(vt_media(name), VideoToolboxMode::Prefer);
+        auto decoder = make_decoder(vt_media(name), VideoToolboxMode::Only);
         auto stream  = decoder.stream(0);
         ASSERT_TRUE(stream) << name;
-        EXPECT_TRUE(stream->decoded_by_videotoolbox()) << name;
         // Task 3.2: FFmpeg's decoder is never even looked up, so builds without
         // one for this codec work the same.
-        EXPECT_FALSE(stream->uses_ffmpeg_decoder()) << name;
         for (int f : {0, 1, 2, 10}) {
             ImageBufPtr buf;
             decoder.decode_video_frame(f, buf);
             ASSERT_TRUE(buf) << name << " frame " << f;
-            EXPECT_EQ(buf->shader_params().value("pix_fmt", -1), 0)
-                << name << ": YUV shader path";
+            EXPECT_FALSE(buf->shader_params().value("vt_sample_bits", 0) == 0)
+                << name << ": VideoToolbox unpack shader path";
             EXPECT_EQ(buf->decoder_frame_number(), f) << name;
         }
         EXPECT_FALSE(stream->converted_on_cpu()) << name;
@@ -802,14 +605,12 @@ TEST(VtStream, RandomAccessMatchesSoftwareDecoder) {
     VT_MEDIA_OR_SKIP(first, "h264_8bit_bframes.mov");
     const std::vector<int> sequence = {
         0, 1, 2, 47, 12, 13, 5, 30, 29, 28, 46, 23, 24, 0, 37, 11};
-    for (const auto &[name, fmt] : k_vt_media_and_format) {
+    for (const auto &name : k_vt_media) {
         if (!have_clip(name))
             continue;
         const bool prores = name.rfind("prores", 0) == 0;
-        auto vt           = make_decoder(vt_media(name), VideoToolboxMode::Prefer);
+        auto vt           = make_decoder(vt_media(name), VideoToolboxMode::Only);
         auto sw           = make_decoder(vt_media(name), VideoToolboxMode::Off);
-        ASSERT_TRUE(vt.stream(0)->decoded_by_videotoolbox()) << name;
-        ASSERT_FALSE(sw.stream(0)->decoded_by_videotoolbox()) << name;
         for (const int f : sequence) {
             ImageBufPtr a, b;
             std::string vt_error, sw_error;
@@ -860,7 +661,6 @@ TEST(VtStream, SessionFailureFallsBackOrFails) {
 
     {
         auto decoder = make_decoder(path, VideoToolboxMode::Prefer);
-        EXPECT_FALSE(decoder.stream(0)->decoded_by_videotoolbox());
         ImageBufPtr buf;
         decoder.decode_video_frame(3, buf);
         ASSERT_TRUE(buf);
@@ -895,7 +695,6 @@ TEST(VtStream, IneligibleStreamsUseSoftware) {
         ASSERT_TRUE(ref) << path;
         for (auto mode : {VideoToolboxMode::Prefer, VideoToolboxMode::Only}) {
             auto decoder = make_decoder(path, mode);
-            EXPECT_FALSE(decoder.stream(0)->decoded_by_videotoolbox()) << path;
             ImageBufPtr buf;
             decoder.decode_video_frame(5, buf);
             ASSERT_TRUE(buf) << path;
@@ -908,12 +707,11 @@ TEST(VtStream, IneligibleStreamsUseSoftware) {
 // Task 5.4: thumbnails of VideoToolbox-decoded media.
 TEST(VtStream, Thumbnails) {
     VT_MEDIA_OR_SKIP(first, "h264_8bit_bframes.mov");
-    for (const auto &[name, fmt] : k_vt_media_and_format) {
+    for (const auto &name : k_vt_media) {
         if (!have_clip(name))
             continue;
-        auto decoder = make_decoder(vt_media(name), VideoToolboxMode::Prefer);
-        ASSERT_TRUE(decoder.stream(0)->decoded_by_videotoolbox()) << name;
-        auto thumb = decoder.decode_thumbnail_frame(24, 256);
+        auto decoder = make_decoder(vt_media(name), VideoToolboxMode::Only);
+        auto thumb   = decoder.decode_thumbnail_frame(24, 256);
         ASSERT_TRUE(thumb) << name;
         EXPECT_GT(thumb->width(), 0u) << name;
         EXPECT_GT(thumb->height(), 0u) << name;

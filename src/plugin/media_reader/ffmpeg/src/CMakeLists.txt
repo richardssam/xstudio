@@ -4,7 +4,6 @@ set(SOURCES
 	ffmpeg_stream.cpp
 	ffmpeg_decoder.cpp
 	ffmpeg.cpp
-	vt_repack.cpp
 )
 
 add_library(${PROJECT_NAME} SHARED ${SOURCES})
@@ -48,15 +47,14 @@ else()
 endif()
 
 if(APPLE)
-	# VideoToolbox decode backend (see vt_decoder.hpp)
-	target_sources(${PROJECT_NAME} PRIVATE vt_decoder.cpp)
+	add_subdirectory(macos)
+	target_include_directories(${PROJECT_NAME} PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR}/macos
+	)
 	target_compile_definitions(${PROJECT_NAME} PRIVATE XSTUDIO_HAS_VIDEOTOOLBOX=1)
 	target_link_libraries(${PROJECT_NAME}
 		PRIVATE
-			"-framework VideoToolbox"
-			"-framework CoreMedia"
-			"-framework CoreVideo"
-			"-framework CoreFoundation"
+			xstudio::media_reader::ffmpeg_macos
 	)
 endif()
 

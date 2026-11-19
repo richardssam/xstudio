@@ -22,6 +22,7 @@ target_link_libraries(ffmpeg_test
 target_include_directories(ffmpeg_test
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../src
+        $<$<PLATFORM_ID:Darwin>:${CMAKE_CURRENT_SOURCE_DIR}/../src/macos>
         ${FFMPEG_INCLUDE_DIRS}
 )
 target_link_directories(ffmpeg_test PRIVATE ${FFMPEG_LIBRARY_DIRS})

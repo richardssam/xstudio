@@ -6,12 +6,7 @@
 
 #include "ffmpeg_stream.hpp"
 #include "xstudio/media/media_error.hpp"
-#ifdef XSTUDIO_HAS_VIDEOTOOLBOX
-#include "vt_decoder.hpp"
-#endif
-
-#include <mutex>
-#include <set>
+#include "xstudio/ui/opengl/shader_program_base.hpp"
 
 #ifdef __GNUC__ // Check if GCC compiler is being used
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
@@ -42,6 +37,235 @@ void xstudio::media_reader::ffmpeg::AVC_CHECK_THROW(int errorNum, const char *av
 }
 
 namespace {
+
+static const utility::Uuid ffmpeg_shader_uuid_yuv{"9854e7c0-2e32-4600-aedd-463b2a6de95a"};
+static const utility::Uuid ffmpeg_shader_uuid_rgb{"20015805-0b83-426a-bf7e-f6549226bfef"};
+
+static const std::string the_shader_yuv = R"(
+#version 410 core
+uniform ivec2 texture_dims;
+uniform int frame_width_pixels;
+uniform int pix_fmt;
+uniform int y_linesize;
+uniform int u_linesize;
+uniform int v_linesize;
+uniform int a_linesize;
+uniform int y_plane_bytes_offset;
+uniform int u_plane_bytes_offset;
+uniform int v_plane_bytes_offset;
+uniform int a_plane_bytes_offset;
+uniform bool half_scale_uvy;
+uniform bool half_scale_uvx;
+uniform int bits_per_channel;
+uniform mat3 yuv_conv;
+uniform ivec3 yuv_offsets;
+uniform float norm_coeff;
+
+uvec4 get_image_data_4bytes(int byte_address);
+
+int get_image_data_2bytes(int byte_address);
+
+int get_image_data_1byte(int byte_address);
+
+int yuv_tex_lookup_10bit(
+	ivec2 image_coord,
+	int offset,
+	int linestride)
+{
+    int address = offset + image_coord.x*2 + image_coord.y*linestride;
+    return get_image_data_2bytes(address);
+}
+
+int yuv_tex_lookup_8bit(
+	ivec2 image_coord,
+	int offset,
+	int linestride)
+{
+    int address = offset + image_coord.x + image_coord.y*linestride;
+    return get_image_data_1byte(address);
+}
+
+vec4 fetch_rgba_pixel(ivec2 image_coord)
+{
+
+    if (image_coord.x < image_bounds_min.x || image_coord.x >= image_bounds_max.x) return vec4(0.0,0.0,0.0,0.0);
+	if (image_coord.y < image_bounds_min.y || image_coord.y >= image_bounds_max.y) return vec4(0.0,0.0,0.0,0.0);
+
+	ivec3 yuv;
+	float a = 1.0;
+
+	ivec2 uv_coord = ivec2(
+		half_scale_uvx ? image_coord.x >> 1 : image_coord.x,
+		half_scale_uvy ? image_coord.y >> 1 : image_coord.y
+		);
+
+	if (bits_per_channel == 10 || bits_per_channel == 12) {
+
+		yuv = ivec3(yuv_tex_lookup_10bit(image_coord, y_plane_bytes_offset, y_linesize),
+			yuv_tex_lookup_10bit(uv_coord, u_plane_bytes_offset, u_linesize),
+			yuv_tex_lookup_10bit(uv_coord, v_plane_bytes_offset, v_linesize)
+			);
+
+		if (half_scale_uvx && ((image_coord.x & 1) == 1) && image_coord.x*2 < frame_width_pixels) {
+
+			uv_coord.x = uv_coord.x + 1;
+			ivec3 yuv2 = ivec3(yuv.x,
+				yuv_tex_lookup_10bit(uv_coord, u_plane_bytes_offset, u_linesize),
+				yuv_tex_lookup_10bit(uv_coord, v_plane_bytes_offset, v_linesize)
+				);
+
+			yuv = (yuv + yuv2) >> 1;
+
+		}
+
+		if (a_linesize != 0) {
+			a = float(yuv_tex_lookup_10bit(image_coord, a_plane_bytes_offset, a_linesize))*norm_coeff;
+		}
+
+	} else {
+
+		yuv = ivec3( yuv_tex_lookup_8bit(image_coord, y_plane_bytes_offset, y_linesize),
+				yuv_tex_lookup_8bit(uv_coord, u_plane_bytes_offset, u_linesize),
+				yuv_tex_lookup_8bit(uv_coord, v_plane_bytes_offset, v_linesize));
+
+		if (a_linesize != 0) {
+			a = float(yuv_tex_lookup_8bit(image_coord, a_plane_bytes_offset, a_linesize))*norm_coeff;
+		}
+
+	}
+
+	yuv -= yuv_offsets;
+
+	return vec4(vec3(yuv) * yuv_conv * norm_coeff, a); //divide by 1023.0
+}
+)";
+
+static const std::string the_shader_rgb = R"(
+#version 410 core
+uniform ivec2 texture_dims;
+uniform int pix_fmt;
+uniform int y_linesize;
+uniform int u_linesize;
+uniform int v_linesize;
+uniform int a_linesize;
+uniform int y_plane_bytes_offset;
+uniform int u_plane_bytes_offset;
+uniform int v_plane_bytes_offset;
+uniform int a_plane_bytes_offset;
+uniform bool half_scale_uvy;
+uniform bool half_scale_uvx;
+uniform int bits_per_channel;
+uniform mat3 yuv_conv;
+uniform ivec3 yuv_offsets;
+uniform float norm_coeff;
+
+uvec4 get_image_data_4bytes(int byte_address);
+
+int get_image_data_2bytes(int byte_address);
+
+int get_image_data_1byte(int byte_address);
+
+vec4 fetch_rgba_pixel_from_rgb24(ivec2 image_coord, bool bgr)
+{
+	int address = image_coord.x*3 + image_coord.y*y_linesize;
+	uvec3 pix_fmt = bgr ? get_image_data_4bytes(address).zyx : get_image_data_4bytes(address).xyz;
+	return vec4(vec3(pix_fmt) * norm_coeff, 1.0);
+}
+
+vec4 fetch_rgba_pixel_from_rgba32(ivec2 image_coord)
+{
+	int address = image_coord.x*4 + image_coord.y*y_linesize;
+	uvec4 rgba = get_image_data_4bytes(address);
+	if (pix_fmt == 3) { // AV_PIX_FMT_ARGB
+		rgba.xyzw = rgba.yzwx;
+	} else if (pix_fmt == 4) { // AV_PIX_FMT_RGBA
+        //nope
+	} else if (pix_fmt == 5) { // AV_PIX_FMT_ABGR
+		rgba.xyzw = rgba.wzyx;
+	} else if (pix_fmt == 6) { // AV_PIX_FMT_BGRA
+		rgba.xyzw = rgba.zyxw;
+	}
+
+	return vec4(rgba) * norm_coeff;
+}
+
+vec4 fetch_rgba_pixel_from_rgb_48(ivec2 image_coord)
+{
+    // 2 bytes per channel, 3 channels per pix
+	int address = image_coord.x*6 + image_coord.y*y_linesize;
+    ivec4 rgba;
+    rgba.x = get_image_data_2bytes(address);
+    rgba.y = get_image_data_2bytes(address+2);
+    rgba.z = get_image_data_2bytes(address+4);
+    return vec4(vec3(rgba.xyz) * norm_coeff, 1.0f);
+}
+
+vec4 fetch_rgba_pixel_from_rgbf32(ivec2 image_coord)
+{
+    // 4 bytes per channel, 3 channels per pix
+	int address = image_coord.x*12 + image_coord.y*y_linesize;
+    ivec4 rgba;
+    return vec4(get_image_data_float32(address),
+        get_image_data_float32(address+4),
+        get_image_data_float32(address+8),
+        1.0
+    );
+}
+
+vec4 fetch_rgba_pixel_from_rgba_64(ivec2 image_coord)
+{
+    // 2 bytes per channel, 4 channels per pix
+	int address = image_coord.x*8 + image_coord.y*y_linesize;
+    ivec4 rgba;
+    rgba.x = get_image_data_2bytes(address);
+    rgba.y = get_image_data_2bytes(address+2);
+    rgba.z = get_image_data_2bytes(address+4);
+    rgba.w = get_image_data_2bytes(address+6);
+    return vec4(rgba) * norm_coeff;
+}
+
+
+vec4 fetch_rgba_pixel_from_gbr_planar(ivec2 image_coord)
+{
+    // 2 bytes per channel, 3 channels per pix
+	int address = image_coord.x*2 + image_coord.y*y_linesize;
+
+    ivec4 rgba;
+    rgba.x = get_image_data_2bytes(address+v_plane_bytes_offset);
+    rgba.y = get_image_data_2bytes(address+y_plane_bytes_offset);
+    rgba.z = get_image_data_2bytes(address+u_plane_bytes_offset);
+    if (a_linesize != 0) {
+        rgba.w = get_image_data_2bytes(address+a_plane_bytes_offset);
+        return vec4(rgba) * norm_coeff;
+    } else {
+        return vec4(vec3(rgba.xyz) * norm_coeff, 1.0f);
+    }
+
+}
+
+vec4 fetch_rgba_pixel(ivec2 image_coord)
+{
+	if (pix_fmt == 10) {
+        return fetch_rgba_pixel_from_rgbf32(image_coord);
+    } else if (pix_fmt == 9) {
+        return fetch_rgba_pixel_from_rgba_64(image_coord);
+     }else if (pix_fmt == 8) {
+		return fetch_rgba_pixel_from_rgb_48(image_coord);
+	} else if (pix_fmt == 7) {
+		return fetch_rgba_pixel_from_gbr_planar(image_coord);
+	} else if (pix_fmt > 2) {
+		return fetch_rgba_pixel_from_rgba32(image_coord);
+	} else {
+		return fetch_rgba_pixel_from_rgb24(image_coord, pix_fmt == 2);
+	}
+}
+)";
+
+static const ui::viewport::GPUShaderPtr
+    ffmpeg_shader_yuv(new ui::opengl::OpenGLShader(ffmpeg_shader_uuid_yuv, the_shader_yuv));
+
+static const ui::viewport::GPUShaderPtr
+    ffmpeg_shader_rgb(new ui::opengl::OpenGLShader(ffmpeg_shader_uuid_rgb, the_shader_rgb));
 
 static const std::set<int> shader_supported_pix_formats = {
     AV_PIX_FMT_RGB24,       AV_PIX_FMT_BGR24,        AV_PIX_FMT_RGB48LE,
@@ -265,35 +489,13 @@ static int setup_video_buffer(AVCodecContext *ctx, AVFrame *ffmpeg_frame_, int /
 
 namespace xstudio::media_reader::ffmpeg {
 
-namespace {
-    // Each FFMpegDecoder (playback, thumbnails, media detail) opens its own streams,
-    // so to log a backend choice once per source rather than once per decoder,
-    // remember what has been logged.
-    bool first_time_for(const std::string &key) {
-        static std::mutex m;
-        static std::set<std::string> seen;
-        std::lock_guard<std::mutex> l(m);
-        return seen.insert(key).second;
-    }
-} // namespace
-
-VideoToolboxMode videotoolbox_mode_from_string(const std::string &value) {
-    if (value == "off")
-        return VideoToolboxMode::Off;
-    if (value == "only")
-        return VideoToolboxMode::Only;
-    return VideoToolboxMode::Prefer;
-}
-
-const char *to_string(const VideoToolboxMode mode) {
-    switch (mode) {
-    case VideoToolboxMode::Off:
-        return "off";
-    case VideoToolboxMode::Only:
-        return "only";
-    default:
-        return "prefer";
-    }
+void populate_shader_pix_format_info(
+    xstudio::utility::JsonStore &metadata,
+    const AVCodecID codec_id,
+    const AVPixelFormat pixel_format,
+    const AVColorRange color_range,
+    const AVColorSpace colorspace) {
+    set_shader_pix_format_info(metadata, codec_id, pixel_format, color_range, colorspace);
 }
 
 // The SWS_CS_* coefficient set matching a stream's colourspace. Only needed where
@@ -613,6 +815,8 @@ ImageBufPtr FFMpegStream::get_ffmpeg_frame_as_xstudio_image() {
         ffmpeg_frame_->colorspace);
 
     image_buffer->set_shader_params(jsn);
+    image_buffer->set_shader(
+        jsn.value("pix_fmt", 0) != 0 ? ffmpeg_shader_rgb : ffmpeg_shader_yuv);
 
     image_buffer->set_display_timestamp_seconds(
         double(ffmpeg_frame_->pts) * double(avc_stream_->time_base.num) /
@@ -808,33 +1012,17 @@ AudioBufPtr FFMpegStream::get_ffmpeg_frame_as_xstudio_audio() {
 }
 
 FFMpegStream::FFMpegStream(
-    AVFormatContext *fmt_ctx,
-    AVStream *stream,
-    int index,
-    int thread_count,
-    std::string path,
-    VideoToolboxMode videotoolbox_mode)
-    : stream_index_(index),
+    AVFormatContext *fmt_ctx, AVStream *stream, int index, int thread_count, std::string path)
+    : FFMpegStreamInterface(fmt_ctx, stream, index, std::move(path)),
       format_context_(fmt_ctx),
-      avc_stream_(stream),
-      source_path(std::move(path)),
-      videotoolbox_mode_(videotoolbox_mode) {
-
+      avc_stream_(stream) {
     codec_type_   = avc_stream_->codecpar->codec_type;
     ffmpeg_frame_ = av_frame_alloc();
-    thread_count_ = thread_count;
-
-    // VideoToolbox gets first refusal on video streams (design D7). FFmpeg's decoder
-    // is only looked for if VideoToolbox doesn't take the stream, so a build without
-    // one (e.g. no h264 decoder) still opens streams VideoToolbox decodes.
     if (codec_type_ == AVMEDIA_TYPE_VIDEO)
-        try_videotoolbox();
+        stream_type_ = VIDEO_STREAM;
 
-    if (!vt_decoder_ && videotoolbox_error_.empty())
-        codec_ = avcodec_find_decoder(avc_stream_->codecpar->codec_id);
-
+    codec_        = avcodec_find_decoder(avc_stream_->codecpar->codec_id);
 #ifdef __APPLE__
-    // AAC through AudioToolbox when FFmpeg was built with it (design D10)
     if (codec_type_ == AVMEDIA_TYPE_AUDIO &&
         avc_stream_->codecpar->codec_id == AV_CODEC_ID_AAC) {
         if (const AVCodec *aac_at = avcodec_find_decoder_by_name("aac_at"))
@@ -869,45 +1057,43 @@ FFMpegStream::FFMpegStream(
 #endif
         }
 
-    } else if (
-        codec_type_ == AVMEDIA_TYPE_VIDEO &&
-        (codec_ || vt_decoder_ || !videotoolbox_error_.empty())) {
+    } else if (codec_type_ == AVMEDIA_TYPE_VIDEO && codec_) {
 
         stream_type_ = VIDEO_STREAM;
 
-        spdlog::debug(
-            "{} video stream {}: videotoolbox mode {}",
-            source_path,
-            stream_index_,
-            to_string(videotoolbox_mode_));
+        if (codec_->capabilities & AV_CODEC_CAP_SLICE_THREADS) {
+            codec_context_->thread_count = thread_count;
+            codec_context_->thread_type  = FF_THREAD_SLICE;
+        }
+        if (codec_->capabilities & AV_CODEC_CAP_FRAME_THREADS) {
+            codec_context_->thread_count = thread_count;
+            codec_context_->thread_type |= FF_THREAD_FRAME;
+        }
 
-        if (codec_) {
-            is_mjpeg = open_software_video_decoder();
-        } else {
-            // VideoToolbox decodes the stream (or should have, and frame requests
-            // will report why it can't). The context only carries the stream
-            // parameters and the pixel format frames come out in.
-            AVC_CHECK_THROW(
-                avcodec_parameters_to_context(codec_context_, avc_stream_->codecpar),
-                "avcodec_parameters_to_context");
-#ifdef XSTUDIO_HAS_VIDEOTOOLBOX
-            if (vt_decoder_) {
-                codec_context_->pix_fmt = vt_decoder_->output_pix_fmt();
-                // frames arrive in an ImageBuffer, as with setup_video_buffer
-                using_own_frame_allocation = true;
+        /** initialize the stream parameters with demuxer information */
+        AVC_CHECK_THROW(
+            avcodec_parameters_to_context(codec_context_, avc_stream_->codecpar),
+            "avcodec_parameters_to_context");
+        AVC_CHECK_THROW(avcodec_open2(codec_context_, codec_, nullptr), "avcodec_open2");
+
+        ffmpeg_frame_->width  = avc_stream_->codecpar->width;
+        ffmpeg_frame_->height = avc_stream_->codecpar->height;
+        ffmpeg_frame_->format = codec_context_->pix_fmt;
+
+        // Note - gif decoder has AV_CODEC_CAP_DR1 flag, but it doesn't appear to work, i.e.
+        // if xstudio takes over ffmpeg_frame_ buffer mem allocation decoding doesn't work
+        // correctly and we get repeated frames in the stream decode
+        if (strcmp(codec_->name, "gif") && (codec_->capabilities & AV_CODEC_CAP_DR1)) {
+
+            // See Note 1 below
+            // codec_ allows us to allocated AVFrame buffers
+            codec_context_->get_buffer2 = setup_video_buffer;
+            using_own_frame_allocation  = true;
+            if (!strcmp(codec_->name, "mjpeg")) {
+                is_mjpeg = true;
             }
-#endif
-            ffmpeg_frame_->width  = avc_stream_->codecpar->width;
-            ffmpeg_frame_->height = avc_stream_->codecpar->height;
-            ffmpeg_frame_->format = codec_context_->pix_fmt;
         }
-
-        // store resolution and pixel aspect
-        resolution_ = Imath::V2f(avc_stream_->codecpar->width, avc_stream_->codecpar->height);
-        auto sar    = av_guess_sample_aspect_ratio(format_context_, avc_stream_, nullptr);
-        if (sar.num && sar.den) {
-            pixel_aspect_ = float(sar.num) / float(sar.den);
-        }
+        codec_context_->opaque = this;
 
     } else if (codec_type_ == AVMEDIA_TYPE_AUDIO && codec_) {
         stream_type_ = AUDIO_STREAM;
@@ -940,151 +1126,53 @@ FFMpegStream::FFMpegStream(
 
         if (is_mjpeg && avc_stream_->r_frame_rate.num != 0 &&
             avc_stream_->r_frame_rate.den != 0) {
-            fpsNum_     = avc_stream_->r_frame_rate.num;
-            fpsDen_     = avc_stream_->r_frame_rate.den;
+            fps_num_    = avc_stream_->r_frame_rate.num;
+            fps_den_    = avc_stream_->r_frame_rate.den;
             frame_rate_ = xstudio::utility::FrameRate(
-                static_cast<double>(fpsDen_) / static_cast<double>(fpsNum_));
+                static_cast<double>(fps_den_) / static_cast<double>(fps_num_));
         } else if (
             avc_stream_->avg_frame_rate.num != 0 && avc_stream_->avg_frame_rate.den != 0) {
-            fpsNum_     = avc_stream_->avg_frame_rate.num;
-            fpsDen_     = avc_stream_->avg_frame_rate.den;
+            fps_num_    = avc_stream_->avg_frame_rate.num;
+            fps_den_    = avc_stream_->avg_frame_rate.den;
             frame_rate_ = xstudio::utility::FrameRate(
-                static_cast<double>(fpsDen_) / static_cast<double>(fpsNum_));
+                static_cast<double>(fps_den_) / static_cast<double>(fps_num_));
         } else if (avc_stream_->r_frame_rate.num != 0 && avc_stream_->r_frame_rate.den != 0) {
-            fpsNum_     = avc_stream_->r_frame_rate.num;
-            fpsDen_     = avc_stream_->r_frame_rate.den;
+            fps_num_    = avc_stream_->r_frame_rate.num;
+            fps_den_    = avc_stream_->r_frame_rate.den;
             frame_rate_ = xstudio::utility::FrameRate(
-                static_cast<double>(fpsDen_) / static_cast<double>(fpsNum_));
+                static_cast<double>(fps_den_) / static_cast<double>(fps_num_));
         } else {
-            fpsNum_     = 0;
-            fpsDen_     = 0;
+            fps_num_    = 0;
+            fps_den_    = 0;
             frame_rate_ = xstudio::utility::FrameRate(timebase::k_flicks_24fps);
         }
     }
 }
 
-bool FFMpegStream::open_software_video_decoder() {
+FFMpegStreamInterface::FFMpegStreamInterface(
+    AVFormatContext *fmt_ctx, AVStream *stream, int index, std::string path)
+    : stream_index_(index), stream_data_{}, source_path(std::move(path)) {
+    stream_data_.resolution         = {stream->codecpar->width, stream->codecpar->height};
+    stream_data_.codec_id           = stream->codecpar->codec_id;
+    stream_data_.time_base          = stream->time_base;
+    stream_data_.duration           = stream->duration;
+    stream_data_.format_duration    = fmt_ctx->duration;
+    stream_data_.frame_count        = stream->nb_frames;
+    stream_data_.average_frame_rate = stream->avg_frame_rate;
+    stream_data_.tags               = stream->metadata;
+    stream_data_.dneg_mov           = utility::ends_with(fmt_ctx->url, ".dneg.mov");
+    const auto sar                  = av_guess_sample_aspect_ratio(fmt_ctx, stream, nullptr);
+    stream_data_.pixel_aspect = sar.num && sar.den ? float(sar.num) / float(sar.den) : 1.0f;
 
-    bool is_mjpeg = false;
-
-    if (codec_->capabilities & AV_CODEC_CAP_SLICE_THREADS) {
-        codec_context_->thread_count = thread_count_;
-        codec_context_->thread_type  = FF_THREAD_SLICE;
+    if (stream->avg_frame_rate.num && stream->avg_frame_rate.den) {
+        fps_num_ = stream->avg_frame_rate.num;
+        fps_den_ = stream->avg_frame_rate.den;
+    } else if (stream->r_frame_rate.num && stream->r_frame_rate.den) {
+        fps_num_ = stream->r_frame_rate.num;
+        fps_den_ = stream->r_frame_rate.den;
     }
-    if (codec_->capabilities & AV_CODEC_CAP_FRAME_THREADS) {
-        codec_context_->thread_count = thread_count_;
-        codec_context_->thread_type |= FF_THREAD_FRAME;
-    }
-
-    /** initialize the stream parameters with demuxer information */
-    AVC_CHECK_THROW(
-        avcodec_parameters_to_context(codec_context_, avc_stream_->codecpar),
-        "avcodec_parameters_to_context");
-    AVC_CHECK_THROW(avcodec_open2(codec_context_, codec_, nullptr), "avcodec_open2");
-
-    ffmpeg_frame_->width  = avc_stream_->codecpar->width;
-    ffmpeg_frame_->height = avc_stream_->codecpar->height;
-    ffmpeg_frame_->format = codec_context_->pix_fmt;
-
-    // Note - gif decoder has AV_CODEC_CAP_DR1 flag, but it doesn't appear to work, i.e.
-    // if xstudio takes over ffmpeg_frame_ buffer mem allocation decoding doesn't work
-    // correctly and we get repeated frames in the stream decode
-    if (strcmp(codec_->name, "gif") && (codec_->capabilities & AV_CODEC_CAP_DR1)) {
-
-        // See Note 1 below
-        // codec_ allows us to allocated AVFrame buffers
-        codec_context_->get_buffer2 = setup_video_buffer;
-        using_own_frame_allocation  = true;
-        if (!strcmp(codec_->name, "mjpeg")) {
-            is_mjpeg = true;
-        }
-    } else {
-        using_own_frame_allocation = false;
-    }
-    codec_context_->opaque = this;
-
-    return is_mjpeg;
-}
-
-void FFMpegStream::try_videotoolbox() {
-#ifdef XSTUDIO_HAS_VIDEOTOOLBOX
-    const char *codec_name = avcodec_get_name(avc_stream_->codecpar->codec_id);
-
-    if (videotoolbox_mode_ == VideoToolboxMode::Off) {
-        if (first_time_for(source_path + "|ffmpeg|off"))
-            spdlog::info(
-                "{}: {} video decoded by FFmpeg (VideoToolbox is off)",
-                source_path,
-                codec_name);
-        return;
-    }
-
-    std::string reason;
-    if (!VtDecoder::eligible(avc_stream_, reason)) {
-        if (first_time_for(source_path + "|ffmpeg"))
-            spdlog::info(
-                "{}: {} video decoded by FFmpeg ({})", source_path, codec_name, reason);
-        return;
-    }
-
-    std::unique_ptr<VtDecoder> vt = VtDecoder::create(avc_stream_, reason);
-    if (vt) {
-        if (first_time_for(source_path + "|videotoolbox"))
-            spdlog::info(
-                "{}: {} video decoded by VideoToolbox ({}, {})",
-                source_path,
-                codec_name,
-                vt->output_format_name(),
-                vt->using_hardware() ? "hardware" : "software");
-        vt_decoder_ = std::move(vt);
-        return;
-    }
-
-    // VideoToolbox should have taken the stream but couldn't
-    const bool can_fall_back = videotoolbox_mode_ == VideoToolboxMode::Prefer &&
-                               avcodec_find_decoder(avc_stream_->codecpar->codec_id);
-    if (can_fall_back) {
-        if (first_time_for(source_path + "|fallback"))
-            spdlog::warn(
-                "{}: VideoToolbox can't decode this {} video ({}); using FFmpeg's decoder",
-                source_path,
-                codec_name,
-                reason);
-    } else {
-        videotoolbox_error_ =
-            fmt::format("VideoToolbox decoding unavailable for {}: {}", codec_name, reason);
-        if (first_time_for(source_path + "|failed"))
-            spdlog::warn("{}: {}", source_path, videotoolbox_error_);
-    }
-#endif
-}
-
-void FFMpegStream::fall_back_to_software(const std::string &reason) {
-
-    vt_decoder_.reset();
-    const char *codec_name = avcodec_get_name(avc_stream_->codecpar->codec_id);
-    const AVCodec *codec   = videotoolbox_mode_ == VideoToolboxMode::Prefer
-                                 ? avcodec_find_decoder(avc_stream_->codecpar->codec_id)
-                                 : nullptr;
-    if (!codec) {
-        videotoolbox_error_ =
-            fmt::format("VideoToolbox decoding unavailable for {}: {}", codec_name, reason);
-        if (first_time_for(source_path + "|failed"))
-            spdlog::warn("{}: {}", source_path, videotoolbox_error_);
-        throw videotoolbox_unavailable_error(videotoolbox_error_);
-    }
-
-    if (first_time_for(source_path + "|fallback"))
-        spdlog::warn(
-            "{}: VideoToolbox can't decode this {} video ({}); using FFmpeg's decoder",
-            source_path,
-            codec_name,
-            reason);
-
-    codec_ = codec;
-    avcodec_free_context(&codec_context_);
-    codec_context_ = avcodec_alloc_context3(codec_);
-    open_software_video_decoder();
+    frame_rate_ = fps_num_ && fps_den_ ? utility::FrameRate(double(fps_den_) / double(fps_num_))
+                                       : utility::FrameRate(timebase::k_flicks_24fps);
 }
 
 FFMpegStream::~FFMpegStream() {
@@ -1102,7 +1190,9 @@ FFMpegStream::~FFMpegStream() {
         sws_freeContext(sws_context_);
 }
 
-void FFMpegStream::set_virtual_frame_rate(const utility::FrameRate &vfr) { frame_rate_ = vfr; }
+void FFMpegStreamInterface::set_virtual_frame_rate(const utility::FrameRate &vfr) {
+    frame_rate_ = vfr;
+}
 
 int64_t FFMpegStream::current_frame() {
 
@@ -1113,21 +1203,12 @@ int64_t FFMpegStream::current_frame() {
     if (current_frame_ != CURRENT_FRAME_UNKNOWN)
         return current_frame_;
 
-    current_frame_ = 0;
-    if (fpsNum_) {
-        current_frame_ = int(round(
-            double(
-                (ffmpeg_frame_->best_effort_timestamp) * avc_stream_->time_base.num * fpsNum_) /
-            double(avc_stream_->time_base.den * fpsDen_)));
-    } else {
-        current_frame_ = ((ffmpeg_frame_->best_effort_timestamp) * avc_stream_->time_base.num) /
-                         (avc_stream_->time_base.den);
-    }
+    current_frame_ = frame_for_timestamp(ffmpeg_frame_->best_effort_timestamp);
 
     return current_frame_;
 }
 
-int64_t FFMpegStream::frame_to_pts(int ffmpeg_frame_) const {
+int64_t FFMpegStreamInterface::frame_to_pts(int ffmpeg_frame_) const {
 
     return seconds_to_pts(double(ffmpeg_frame_) * frame_rate().to_seconds());
 }
@@ -1330,19 +1411,7 @@ int64_t FFMpegStream::receive_frame() {
 
     av_frame_unref(ffmpeg_frame_);
 
-    if (!videotoolbox_error_.empty())
-        throw videotoolbox_unavailable_error(videotoolbox_error_);
-
-    int rt = 0;
-#ifdef XSTUDIO_HAS_VIDEOTOOLBOX
-    if (vt_decoder_) {
-        rt = vt_decoder_->receive_frame(ffmpeg_frame_);
-        // ProRes 4444 alpha is only known once the first frame header is seen
-        if (!rt)
-            codec_context_->pix_fmt = AVPixelFormat(ffmpeg_frame_->format);
-    } else
-#endif
-        rt = avcodec_receive_frame(codec_context_, ffmpeg_frame_);
+    int rt = avcodec_receive_frame(codec_context_, ffmpeg_frame_);
 
     // std::cerr << source_path << " WAS " << ffmpeg_frame_->pts << "\n";
 
@@ -1364,95 +1433,59 @@ int64_t FFMpegStream::receive_frame() {
     return rt;
 }
 
-void FFMpegStream::send_flush_packet() {
-#ifdef XSTUDIO_HAS_VIDEOTOOLBOX
-    if (vt_decoder_) {
-        vt_decoder_->send_packet(nullptr);
-        return;
-    }
-#endif
-    if (videotoolbox_error_.empty())
-        avcodec_send_packet(codec_context_, nullptr);
-}
+void FFMpegStream::send_flush_packet() { avcodec_send_packet(codec_context_, nullptr); }
 
 int FFMpegStream::send_packet(AVPacket *avc_packet_) {
-
-    if (!videotoolbox_error_.empty()) {
-        av_packet_unref(avc_packet_);
-        throw videotoolbox_unavailable_error(videotoolbox_error_);
-    }
-
-#ifdef XSTUDIO_HAS_VIDEOTOOLBOX
-    if (vt_decoder_) {
-        int rt = vt_decoder_->send_packet(avc_packet_);
-        if (rt == AVERROR(ENOTSUP)) {
-            // e.g. packets without timestamps (design D8)
-            try {
-                fall_back_to_software("stream packets have no timestamps");
-            } catch (...) {
-                av_packet_unref(avc_packet_);
-                throw;
-            }
-        } else {
-            av_packet_unref(avc_packet_);
-            return rt;
-        }
-    }
-#endif
-
     int rt = avcodec_send_packet(codec_context_, avc_packet_);
     av_packet_unref(avc_packet_);
     return rt;
 }
 
-void FFMpegStream::flush_buffers() {
-#ifdef XSTUDIO_HAS_VIDEOTOOLBOX
-    if (vt_decoder_) {
-        vt_decoder_->flush();
-        return;
-    }
-#endif
-    if (videotoolbox_error_.empty())
-        avcodec_flush_buffers(codec_context_);
-}
+void FFMpegStream::flush_buffers() { avcodec_flush_buffers(codec_context_); }
 
-double FFMpegStream::duration_seconds() const {
-
-    if (avc_stream_->time_base.num &&
-        avc_stream_->duration != std::numeric_limits<int64_t>::lowest()) {
-
-        return double(avc_stream_->duration * avc_stream_->time_base.num) /
-               double(avc_stream_->time_base.den);
-
-    } else {
-        // stream duration is not known. Applying some rules based on trial and
-        // error investigation.
-        if (format_context_->duration > 0 &&
-            avc_stream_->duration == std::numeric_limits<int64_t>::lowest()) {
-            // I've found that on MKV/VP8 (webm) sources, if duration is set on the
-            // AVFormatContext it is stated in microseconds (AV_TIME_BASE), not in the timebase
-            // of the AVStream. Undocumented behaviour in ffmpeg, of course.
-            return double(format_context_->duration) * 0.000001;
-        } else if (avc_stream_->nb_frames > 0 && avc_stream_->avg_frame_rate.num) {
-            // maybe we know the number of frames and ffmpeg_frame_ rate
-            return double(avc_stream_->nb_frames * avc_stream_->avg_frame_rate.den) /
-                   double(avc_stream_->avg_frame_rate.num);
-        } else if (avc_stream_->time_base.num) {
-            // single ffmpeg_frame_ source
-            return double(avc_stream_->time_base.num) / double(avc_stream_->time_base.den);
-        }
-    }
-    // fallback, assume single ffmpeg_frame_ source
+double FFMpegStreamInterface::duration_seconds() const {
+    if (stream_data_.time_base.num &&
+        stream_data_.duration != std::numeric_limits<int64_t>::lowest())
+        return double(stream_data_.duration * stream_data_.time_base.num) /
+               double(stream_data_.time_base.den);
+    if (stream_data_.format_duration > 0 &&
+        stream_data_.duration == std::numeric_limits<int64_t>::lowest())
+        return double(stream_data_.format_duration) * 0.000001;
+    if (stream_data_.frame_count > 0 && stream_data_.average_frame_rate.num)
+        return double(stream_data_.frame_count * stream_data_.average_frame_rate.den) /
+               double(stream_data_.average_frame_rate.num);
+    if (stream_data_.time_base.num)
+        return double(stream_data_.time_base.num) / double(stream_data_.time_base.den);
     return frame_rate().to_seconds();
 }
 
-int FFMpegStream::duration_frames() const {
-
-    if (stream_type_ == VIDEO_STREAM && !fpsDen_) {
-        // no average ffmpeg_frame_ rate defined, assume it's a single pic
+int FFMpegStreamInterface::duration_frames() const {
+    if (stream_type() == VIDEO_STREAM && !fps_den_)
         return 1;
+    return int(round(duration_seconds() / frame_rate().to_seconds()));
+}
+
+int64_t FFMpegStreamInterface::seconds_to_pts(const double seconds) const {
+    return stream_data_.time_base.num ? int64_t(
+                                            seconds * double(stream_data_.time_base.den) /
+                                            double(stream_data_.time_base.num))
+                                      : 0;
+}
+
+double FFMpegStreamInterface::pts_to_seconds(const int64_t pts) const {
+    return stream_data_.time_base.den
+               ? double(pts) * double(stream_data_.time_base.num) /
+                     double(stream_data_.time_base.den)
+               : 0.0;
+}
+
+int64_t FFMpegStreamInterface::frame_for_timestamp(const int64_t timestamp) const {
+    if (fps_num_) {
+        return int(round(
+            double(timestamp * stream_data_.time_base.num * fps_num_) /
+            double(stream_data_.time_base.den * fps_den_)));
     }
-    return (int)round(duration_seconds() / frame_rate().to_seconds());
+    return timestamp * stream_data_.time_base.num / stream_data_.time_base.den;
 }
 
 

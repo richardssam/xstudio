@@ -94,234 +94,6 @@ ImageBufPtr make_blank_image() {
 
 
 static Uuid s_plugin_uuid("87557f93-55f8-4650-8905-4834f1f4b78d");
-static Uuid ffmpeg_shader_uuid_yuv{"9854e7c0-2e32-4600-aedd-463b2a6de95a"};
-static Uuid ffmpeg_shader_uuid_rgb{"20015805-0b83-426a-bf7e-f6549226bfef"};
-
-static std::string the_shader_yuv = {R"(
-#version 410 core
-uniform ivec2 texture_dims;
-uniform int frame_width_pixels;
-uniform int pix_fmt;
-uniform int y_linesize;
-uniform int u_linesize;
-uniform int v_linesize;
-uniform int a_linesize;
-uniform int y_plane_bytes_offset;
-uniform int u_plane_bytes_offset;
-uniform int v_plane_bytes_offset;
-uniform int a_plane_bytes_offset;
-uniform bool half_scale_uvy;
-uniform bool half_scale_uvx;
-uniform int bits_per_channel;
-uniform mat3 yuv_conv;
-uniform ivec3 yuv_offsets;
-uniform float norm_coeff;
-
-uvec4 get_image_data_4bytes(int byte_address);
-
-int get_image_data_2bytes(int byte_address);
-
-int get_image_data_1byte(int byte_address);
-
-int yuv_tex_lookup_10bit(
-	ivec2 image_coord,
-	int offset,
-	int linestride)
-{
-    int address = offset + image_coord.x*2 + image_coord.y*linestride;
-    return get_image_data_2bytes(address);
-}
-
-int yuv_tex_lookup_8bit(
-	ivec2 image_coord,
-	int offset,
-	int linestride)
-{
-    int address = offset + image_coord.x + image_coord.y*linestride;
-    return get_image_data_1byte(address);
-}
-
-vec4 fetch_rgba_pixel(ivec2 image_coord)
-{
-
-    if (image_coord.x < image_bounds_min.x || image_coord.x >= image_bounds_max.x) return vec4(0.0,0.0,0.0,0.0);
-	if (image_coord.y < image_bounds_min.y || image_coord.y >= image_bounds_max.y) return vec4(0.0,0.0,0.0,0.0);
-
-	ivec3 yuv;
-	float a = 1.0;
-
-	ivec2 uv_coord = ivec2(
-		half_scale_uvx ? image_coord.x >> 1 : image_coord.x,
-		half_scale_uvy ? image_coord.y >> 1 : image_coord.y
-		);
-
-	if (bits_per_channel == 10 || bits_per_channel == 12) {
-
-		yuv = ivec3(yuv_tex_lookup_10bit(image_coord, y_plane_bytes_offset, y_linesize),
-			yuv_tex_lookup_10bit(uv_coord, u_plane_bytes_offset, u_linesize),
-			yuv_tex_lookup_10bit(uv_coord, v_plane_bytes_offset, v_linesize)
-			);
-
-		if (half_scale_uvx && ((image_coord.x & 1) == 1) && image_coord.x*2 < frame_width_pixels) {
-
-			uv_coord.x = uv_coord.x + 1;
-			ivec3 yuv2 = ivec3(yuv.x,
-				yuv_tex_lookup_10bit(uv_coord, u_plane_bytes_offset, u_linesize),
-				yuv_tex_lookup_10bit(uv_coord, v_plane_bytes_offset, v_linesize)
-				);
-
-			yuv = (yuv + yuv2) >> 1;
-
-		}
-
-		if (a_linesize != 0) {
-			a = float(yuv_tex_lookup_10bit(image_coord, a_plane_bytes_offset, a_linesize))*norm_coeff;
-		}
-
-	} else {
-
-		yuv = ivec3( yuv_tex_lookup_8bit(image_coord, y_plane_bytes_offset, y_linesize),
-				yuv_tex_lookup_8bit(uv_coord, u_plane_bytes_offset, u_linesize),
-				yuv_tex_lookup_8bit(uv_coord, v_plane_bytes_offset, v_linesize));
-
-		if (a_linesize != 0) {
-			a = float(yuv_tex_lookup_8bit(image_coord, a_plane_bytes_offset, a_linesize))*norm_coeff;
-		}
-
-	}
-
-	yuv -= yuv_offsets;
-
-	return vec4(vec3(yuv) * yuv_conv * norm_coeff, a); //divide by 1023.0
-}
-)"};
-
-static std::string the_shader_rgb = {R"(
-#version 410 core
-uniform ivec2 texture_dims;
-uniform int pix_fmt;
-uniform int y_linesize;
-uniform int u_linesize;
-uniform int v_linesize;
-uniform int a_linesize;
-uniform int y_plane_bytes_offset;
-uniform int u_plane_bytes_offset;
-uniform int v_plane_bytes_offset;
-uniform int a_plane_bytes_offset;
-uniform bool half_scale_uvy;
-uniform bool half_scale_uvx;
-uniform int bits_per_channel;
-uniform mat3 yuv_conv;
-uniform ivec3 yuv_offsets;
-uniform float norm_coeff;
-
-uvec4 get_image_data_4bytes(int byte_address);
-
-int get_image_data_2bytes(int byte_address);
-
-int get_image_data_1byte(int byte_address);
-
-vec4 fetch_rgba_pixel_from_rgb24(ivec2 image_coord, bool bgr)
-{
-	int address = image_coord.x*3 + image_coord.y*y_linesize;
-	uvec3 pix_fmt = bgr ? get_image_data_4bytes(address).zyx : get_image_data_4bytes(address).xyz;
-	return vec4(vec3(pix_fmt) * norm_coeff, 1.0);
-}
-
-vec4 fetch_rgba_pixel_from_rgba32(ivec2 image_coord)
-{
-	int address = image_coord.x*4 + image_coord.y*y_linesize;
-	uvec4 rgba = get_image_data_4bytes(address);
-	if (pix_fmt == 3) { // AV_PIX_FMT_ARGB
-		rgba.xyzw = rgba.yzwx;
-	} else if (pix_fmt == 4) { // AV_PIX_FMT_RGBA
-        //nope
-	} else if (pix_fmt == 5) { // AV_PIX_FMT_ABGR
-		rgba.xyzw = rgba.wzyx;
-	} else if (pix_fmt == 6) { // AV_PIX_FMT_BGRA
-		rgba.xyzw = rgba.zyxw;
-	}
-
-	return vec4(rgba) * norm_coeff;
-}
-
-vec4 fetch_rgba_pixel_from_rgb_48(ivec2 image_coord)
-{
-    // 2 bytes per channel, 3 channels per pix
-	int address = image_coord.x*6 + image_coord.y*y_linesize;
-    ivec4 rgba;
-    rgba.x = get_image_data_2bytes(address);
-    rgba.y = get_image_data_2bytes(address+2);
-    rgba.z = get_image_data_2bytes(address+4);
-    return vec4(vec3(rgba.xyz) * norm_coeff, 1.0f);
-}
-
-vec4 fetch_rgba_pixel_from_rgbf32(ivec2 image_coord)
-{
-    // 4 bytes per channel, 3 channels per pix
-	int address = image_coord.x*12 + image_coord.y*y_linesize;
-    ivec4 rgba;
-    return vec4(get_image_data_float32(address),
-        get_image_data_float32(address+4),
-        get_image_data_float32(address+8),
-        1.0
-    );
-}
-
-vec4 fetch_rgba_pixel_from_rgba_64(ivec2 image_coord)
-{
-    // 2 bytes per channel, 4 channels per pix
-	int address = image_coord.x*8 + image_coord.y*y_linesize;
-    ivec4 rgba;
-    rgba.x = get_image_data_2bytes(address);
-    rgba.y = get_image_data_2bytes(address+2);
-    rgba.z = get_image_data_2bytes(address+4);
-    rgba.w = get_image_data_2bytes(address+6);
-    return vec4(rgba) * norm_coeff;
-}
-
-
-vec4 fetch_rgba_pixel_from_gbr_planar(ivec2 image_coord)
-{
-    // 2 bytes per channel, 3 channels per pix
-	int address = image_coord.x*2 + image_coord.y*y_linesize;
-
-    ivec4 rgba;
-    rgba.x = get_image_data_2bytes(address+v_plane_bytes_offset);
-    rgba.y = get_image_data_2bytes(address+y_plane_bytes_offset);
-    rgba.z = get_image_data_2bytes(address+u_plane_bytes_offset);
-    if (a_linesize != 0) {
-        rgba.w = get_image_data_2bytes(address+a_plane_bytes_offset);
-        return vec4(rgba) * norm_coeff;
-    } else {
-        return vec4(vec3(rgba.xyz) * norm_coeff, 1.0f);
-    }
-
-}
-
-vec4 fetch_rgba_pixel(ivec2 image_coord)
-{
-	if (pix_fmt == 10) {
-        return fetch_rgba_pixel_from_rgbf32(image_coord);
-    } else if (pix_fmt == 9) {
-        return fetch_rgba_pixel_from_rgba_64(image_coord);
-     }else if (pix_fmt == 8) {
-		return fetch_rgba_pixel_from_rgb_48(image_coord);
-	} else if (pix_fmt == 7) {
-		return fetch_rgba_pixel_from_gbr_planar(image_coord);
-	} else if (pix_fmt > 2) {
-		return fetch_rgba_pixel_from_rgba32(image_coord);
-	} else {
-		return fetch_rgba_pixel_from_rgb24(image_coord, pix_fmt == 2);
-	}
-}
-)"};
-
-static ui::viewport::GPUShaderPtr
-    ffmpeg_shader_yuv(new ui::opengl::OpenGLShader(ffmpeg_shader_uuid_yuv, the_shader_yuv));
-
-static ui::viewport::GPUShaderPtr
-    ffmpeg_shader_rgb(new ui::opengl::OpenGLShader(ffmpeg_shader_uuid_rgb, the_shader_rgb));
 
 // See 'uri_convert' - I'm doing this because 'uri_to_posix_path' which is used
 // in most places we need to go from uri to filsystem can't deal with uris like
@@ -468,11 +240,6 @@ ImageBufPtr FFMpegMediaReader::image(const media::AVFrameID &mptr) {
         decoder->decode_video_frame(mptr.frame(), rt);
 
         if (rt && !rt->shader_params().is_null()) {
-            if (rt->shader_params().value("pix_fmt", 0) != 0) {
-                rt->set_shader(ffmpeg_shader_rgb);
-            } else {
-                rt->set_shader(ffmpeg_shader_yuv);
-            }
             last_decoded_image_ = rt;
         }
 
@@ -548,13 +315,13 @@ xstudio::media::MediaDetail FFMpegMediaReader::detail(const caf::uri &uri) const
     bool have_audio_stream = false;
 
     for (auto &p : t_decoder.streams()) {
-        if (p.second->codec_type() == AVMEDIA_TYPE_VIDEO ||
-            p.second->codec_type() == AVMEDIA_TYPE_AUDIO) {
+        if (p.second->stream_type() == VIDEO_STREAM ||
+            p.second->stream_type() == AUDIO_STREAM) {
 
             auto frameRate = t_decoder.frame_rate(p.first);
 
-            have_audio_stream |= p.second->codec_type() == AVMEDIA_TYPE_AUDIO;
-            have_video_stream |= p.second->codec_type() == AVMEDIA_TYPE_VIDEO;
+            have_audio_stream |= p.second->stream_type() == AUDIO_STREAM;
+            have_video_stream |= p.second->stream_type() == VIDEO_STREAM;
 
             // If the stream has a duration of 1 then it is probably frame based.
             // FFMPEG assigns a default frame rate of 25fps to JPEGs, for example -
@@ -571,9 +338,9 @@ xstudio::media::MediaDetail FFMpegMediaReader::detail(const caf::uri &uri) const
                     utility::FrameRateDuration(
                         static_cast<int>(t_decoder.duration_frames()), frameRate),
                     fmt::format("stream {}", p.first),
-                    (p.second->codec_type() == AVMEDIA_TYPE_VIDEO ? media::MT_IMAGE
-                                                                  : media::MT_AUDIO),
-                    p.second->codec_type() == AVMEDIA_TYPE_VIDEO
+                    (p.second->stream_type() == VIDEO_STREAM ? media::MT_IMAGE
+                                                             : media::MT_AUDIO),
+                    p.second->stream_type() == VIDEO_STREAM
                         ? "{0}@{1}/{2},{3}"
                         : "{0}@{1}/{2},{3},{4}", // for audio source, the media rate is made
                                                  // part of the cache key
@@ -684,8 +451,8 @@ PixelInfo FFMpegMediaReader::ffmpeg_buffer_pixel_picker(
     const Imath::V2i &pixel_location,
     const std::vector<Imath::V2i> &extra_pixel_locations) {
 
-    // This function is close to being a C++ implementation of the the
-    // glsl shader(s) at the top of this file. It allows xstudio to inspect
+    // This function is close to being a C++ implementation of the FFmpeg
+    // stream GLSL shaders. It allows xstudio to inspect
     // individual pixel values from the frame buffer.
     try {
 
@@ -713,6 +480,7 @@ PixelInfo FFMpegMediaReader::ffmpeg_buffer_pixel_picker(
         const int half_scale_uvy       = pixel_unpack_uniforms.value("half_scale_uvy", 0);
         const int half_scale_uvx       = pixel_unpack_uniforms.value("half_scale_uvx", 0);
         const int bits_per_channel     = pixel_unpack_uniforms.value("bits_per_channel", 0);
+        const int vt_sample_bits       = pixel_unpack_uniforms.value("vt_sample_bits", 0);
         const Imath::M33f yuv_conv     = pixel_unpack_uniforms.value("yuv_conv", Imath::M33f());
         const Imath::V3i yuv_offsets = pixel_unpack_uniforms.value("yuv_offsets", Imath::V3i());
         const float norm_coeff       = pixel_unpack_uniforms.value("norm_coeff", 1.0f);
@@ -797,7 +565,41 @@ PixelInfo FFMpegMediaReader::ffmpeg_buffer_pixel_picker(
                 half_scale_uvx ? image_coord.x >> 1 : image_coord.x,
                 half_scale_uvy ? image_coord.y >> 1 : image_coord.y);
 
-            if (bits_per_channel == 10 || bits_per_channel == 12) {
+            if (vt_sample_bits) {
+                auto read_sample =
+                    [&](const Imath::V2i coord, const int offset, const int stride) {
+                        int sample = vt_sample_bits == 8
+                                         ? yuv_tex_lookup_8bit(coord, offset, stride)
+                                         : yuv_tex_lookup_10bit(coord, offset, stride);
+                        return vt_sample_bits == 10 ? sample >> 6 : sample;
+                    };
+
+                if (pixel_unpack_uniforms.value("vt_chroma_interleaved", false)) {
+                    const int bytes_per_sample = vt_sample_bits == 8 ? 1 : 2;
+                    const int chroma_address =
+                        u_plane_bytes_offset + uv_coord.x * 2 * bytes_per_sample +
+                        uv_coord.y * u_linesize;
+                    yuv = Imath::V3i(
+                        read_sample(image_coord, y_plane_bytes_offset, y_linesize),
+                        vt_sample_bits == 8 ? get_image_data_1byte(chroma_address)
+                                            : get_image_data_2bytes(chroma_address),
+                        vt_sample_bits == 8 ? get_image_data_1byte(chroma_address + 1)
+                                            : get_image_data_2bytes(chroma_address + 2));
+                } else {
+                    yuv = Imath::V3i(
+                        read_sample(image_coord, y_plane_bytes_offset, y_linesize),
+                        read_sample(uv_coord, u_plane_bytes_offset, u_linesize),
+                        read_sample(uv_coord, v_plane_bytes_offset, v_linesize));
+                }
+                if (vt_sample_bits == 10) {
+                    yuv.y >>= 6;
+                    yuv.z >>= 6;
+                }
+                if (a_linesize != 0) {
+                    a_code = read_sample(image_coord, a_plane_bytes_offset, a_linesize);
+                    a      = float(a_code) * norm_coeff;
+                }
+            } else if (bits_per_channel == 10 || bits_per_channel == 12) {
 
                 yuv = Imath::V3i(
                     yuv_tex_lookup_10bit(image_coord, y_plane_bytes_offset, y_linesize),
