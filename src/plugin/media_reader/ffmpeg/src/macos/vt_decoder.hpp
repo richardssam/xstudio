@@ -8,11 +8,14 @@
 
 #include <memory>
 #include <string>
+#include <cstdint>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 }
+
+#include "xstudio/media_reader/image_buffer.hpp"
 
 namespace xstudio::media_reader::ffmpeg {
 
@@ -22,10 +25,9 @@ The send_packet / receive_frame / flush methods follow the same rules as
 avcodec_send_packet / avcodec_receive_frame / avcodec_flush_buffers, return codes
 included, so FFMpegStream can use it in place of an AVCodecContext.
 
-Frames come out in presentation order, in a planar YUV(A) format the xstudio
-shader reads directly. Their pixel data lives in an xstudio ImageBuffer, which is
-hidden in frame->buf[0] the same way setup_video_buffer() in ffmpeg_stream.cpp
-does it. */
+Frames come out in presentation order in a planar YUV(A) format the xstudio
+shader reads directly. Pixel data and all per-frame metadata are returned in
+the ImageBufPtr; no AVFrame intermediary is required. */
 class VtDecoder {
   public:
     /* Whether the stream's codec and decoder configuration can go to VideoToolbox.
@@ -47,15 +49,12 @@ class VtDecoder {
     negative AVERROR. The packet isn't unreferenced. */
     int send_packet(const AVPacket *packet);
 
-    /* Returns 0 with 'frame' filled, AVERROR(EAGAIN) if more packets are needed,
+    /* Returns 0 with 'image' filled, AVERROR(EAGAIN) if more packets are needed,
     or AVERROR_EOF once fully drained. */
-    int receive_frame(AVFrame *frame);
+    int receive_frame(ImageBufPtr &image);
 
     /* Drops every frame in flight, e.g. before a seek. */
     void flush();
-
-    /* The planar pixel format receive_frame() produces. */
-    [[nodiscard]] AVPixelFormat output_pix_fmt() const;
 
     /* VideoToolbox's name for the session's output format, for logging. */
     [[nodiscard]] std::string output_format_name() const;

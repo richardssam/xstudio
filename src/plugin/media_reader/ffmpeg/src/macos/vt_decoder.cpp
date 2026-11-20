@@ -3,7 +3,6 @@
 // xstudio headers first: the Apple headers further down define a 'nil' macro that
 // breaks caf headers included after them.
 #include "vt_decoder.hpp"
-#include "vt_repack.hpp"
 #include "xstudio/media_reader/image_buffer.hpp"
 #include "xstudio/utility/logging.hpp"
 
@@ -14,10 +13,6 @@
 #include <mutex>
 #include <set>
 
-extern "C" {
-#include <libavutil/pixdesc.h>
-}
-
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMedia/CoreMedia.h>
 #include <CoreVideo/CoreVideo.h>
@@ -27,94 +22,78 @@ namespace xstudio::media_reader::ffmpeg {
 
 namespace {
 
-    // VideoToolbox output formats used here (design D4), and the planar format each
-    // is repacked to.
+    // VideoToolbox output formats and their FFmpeg-equivalent native layouts.
     constexpr OSType ks4as = kCVPixelFormatType_444YpCbCr16VideoRange_16A_TriPlanar; // 's4as'
-
     enum class Packing { Bits8, Bits10InMsbs, Bits16, S4as };
+    enum class Chroma { C420, C422, C444 };
+    enum class VtColorSpace { Unspecified, Bt601, Bt709, Bt2020, Smpte240 };
 
     struct OutputFormat {
         OSType vt;
-        AVPixelFormat target;
         Packing packing;
-        vt_repack::Chroma chroma;
+        Chroma chroma;
         bool full_range;
     };
 
-    using vt_repack::Chroma;
     const OutputFormat k_output_formats[] = {
         {kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-         AV_PIX_FMT_YUV420P,
          Packing::Bits8,
          Chroma::C420,
          false},
         {kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-         AV_PIX_FMT_YUV420P,
          Packing::Bits8,
          Chroma::C420,
          true},
         {kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange,
-         AV_PIX_FMT_YUV422P,
          Packing::Bits8,
          Chroma::C422,
          false},
         {kCVPixelFormatType_422YpCbCr8BiPlanarFullRange,
-         AV_PIX_FMT_YUV422P,
          Packing::Bits8,
          Chroma::C422,
          true},
         {kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange,
-         AV_PIX_FMT_YUV444P,
          Packing::Bits8,
          Chroma::C444,
          false},
         {kCVPixelFormatType_444YpCbCr8BiPlanarFullRange,
-         AV_PIX_FMT_YUV444P,
          Packing::Bits8,
          Chroma::C444,
          true},
         {kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
-         AV_PIX_FMT_YUV420P10LE,
          Packing::Bits10InMsbs,
          Chroma::C420,
          false},
         {kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
-         AV_PIX_FMT_YUV420P10LE,
          Packing::Bits10InMsbs,
          Chroma::C420,
          true},
         {kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange,
-         AV_PIX_FMT_YUV422P10LE,
          Packing::Bits10InMsbs,
          Chroma::C422,
          false},
         {kCVPixelFormatType_422YpCbCr10BiPlanarFullRange,
-         AV_PIX_FMT_YUV422P10LE,
          Packing::Bits10InMsbs,
          Chroma::C422,
          true},
         {kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange,
-         AV_PIX_FMT_YUV444P10LE,
          Packing::Bits10InMsbs,
          Chroma::C444,
          false},
         {kCVPixelFormatType_444YpCbCr10BiPlanarFullRange,
-         AV_PIX_FMT_YUV444P10LE,
          Packing::Bits10InMsbs,
          Chroma::C444,
          true},
         {kCVPixelFormatType_422YpCbCr16BiPlanarVideoRange,
-         AV_PIX_FMT_YUV422P12LE,
          Packing::Bits16,
          Chroma::C422,
          false},
         {kCVPixelFormatType_444YpCbCr16BiPlanarVideoRange,
-         AV_PIX_FMT_YUV444P12LE,
          Packing::Bits16,
          Chroma::C444,
          false},
         // the target here is for 4444 with alpha; without, it's YUV444P12LE
-        {ks4as, AV_PIX_FMT_YUVA444P12LE, Packing::S4as, Chroma::C444, false},
+        {ks4as, Packing::S4as, Chroma::C444, false},
     };
 
     const OutputFormat *output_format(const OSType vt) {
@@ -122,15 +101,6 @@ namespace {
             if (f.vt == vt)
                 return &f;
         return nullptr;
-    }
-
-    // The VideoToolbox format for a bit depth, chroma format and range, 0 if none.
-    OSType
-    output_format_for(const Packing packing, const Chroma chroma, const bool full_range) {
-        for (const auto &f : k_output_formats)
-            if (f.packing == packing && f.chroma == chroma && f.full_range == full_range)
-                return f.vt;
-        return 0;
     }
 
     std::string fourcc_string(const uint32_t f) {
@@ -166,80 +136,13 @@ namespace {
                t == kCMVideoCodecType_AppleProRes4444XQ;
     }
 
-    struct PictureFormat {
-        int bit_depth = 0;
-        int chroma    = 0; // 420, 422 or 444
-    };
-
-    // Bit depth and chroma format of an H.264 stream, from the avcC record. The
-    // High profile extension that carries them is optional; without it the
-    // profile tells us whether it can be anything but 8 bit 4:2:0.
-    bool avcc_picture_format(const uint8_t *d, const int size, PictureFormat &fmt) {
-        if (size < 7 || d[0] != 1)
-            return false;
-        const int profile = d[1];
-        int pos           = 5;
-        const int num_sps = d[pos++] & 0x1f;
-        for (int i = 0; i < num_sps; ++i) {
-            if (pos + 2 > size)
-                return false;
-            pos += 2 + ((d[pos] << 8) | d[pos + 1]);
-        }
-        if (pos + 1 > size)
-            return false;
-        const int num_pps = d[pos++];
-        for (int i = 0; i < num_pps; ++i) {
-            if (pos + 2 > size)
-                return false;
-            pos += 2 + ((d[pos] << 8) | d[pos + 1]);
-        }
-        if (pos > size)
-            return false;
-
-        const bool high_profile = profile == 100 || profile == 110 || profile == 122 ||
-                                  profile == 144 || profile == 244;
-        if (high_profile && pos + 3 <= size) {
-            static const int chroma_formats[] = {400, 420, 422, 444};
-            fmt.chroma                        = chroma_formats[d[pos] & 3];
-            fmt.bit_depth                     = 8 + (d[pos + 1] & 7);
-            return true;
-        }
-        if (profile == 100 || !high_profile) {
-            // Baseline/Main/Extended, and High (not High 10/4:2:2/4:4:4), are
-            // always 8 bit 4:2:0.
-            fmt = {8, 420};
-            return true;
-        }
-        return false;
-    }
-
-    // Bit depth and chroma format of an HEVC stream, from the hvcC record header.
-    bool hvcc_picture_format(const uint8_t *d, const int size, PictureFormat &fmt) {
-        if (size < 23 || d[0] != 1)
-            return false;
-        static const int chroma_formats[] = {400, 420, 422, 444};
-        fmt.chroma                        = chroma_formats[d[16] & 3];
-        fmt.bit_depth                     = 8 + (d[17] & 7);
-        return true;
-    }
-
-    PictureFormat picture_format_from_pix_fmt(const int format) {
-        const AVPixFmtDescriptor *d = av_pix_fmt_desc_get(AVPixelFormat(format));
-        if (!d || (d->flags & AV_PIX_FMT_FLAG_RGB))
-            return {};
-        PictureFormat fmt;
-        fmt.bit_depth = d->comp[0].depth;
-        fmt.chroma    = d->log2_chroma_w == 0 ? 444 : (d->log2_chroma_h ? 420 : 422);
-        return fmt;
-    }
-
     struct Choice {
         CMVideoCodecType codec_type = 0;
-        OSType output_format        = 0;
+        bool prores_4444            = false;
     };
 
-    // Decides whether VideoToolbox should decode the stream, and with which output
-    // format. Returns false with 'reason' set if not.
+    // Decides whether VideoToolbox should decode the stream. VideoToolbox selects
+    // the output pixel format from the codec and decoded frame.
     bool choose(const AVStream *stream, Choice &choice, std::string &reason) {
 
         const AVCodecParameters *par = stream->codecpar;
@@ -256,17 +159,13 @@ namespace {
             return false;
         }
 
-        const bool full_range = par->color_range == AVCOL_RANGE_JPEG;
-
         if (par->codec_id == AV_CODEC_ID_PRORES) {
             choice.codec_type = prores_codec_type(par->codec_tag);
             if (!choice.codec_type) {
                 reason = "unrecognised ProRes codec tag";
                 return false;
             }
-            choice.output_format = is_prores_4444(choice.codec_type)
-                                       ? ks4as
-                                       : kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange;
+            choice.prores_4444 = is_prores_4444(choice.codec_type);
             return true;
         }
 
@@ -283,57 +182,8 @@ namespace {
             return false;
         }
 
-        PictureFormat fmt;
-        const bool parsed = par->codec_id == AV_CODEC_ID_H264
-                                ? avcc_picture_format(par->extradata, par->extradata_size, fmt)
-                                : hvcc_picture_format(par->extradata, par->extradata_size, fmt);
-        if (!parsed)
-            fmt = picture_format_from_pix_fmt(par->format);
-
         choice.codec_type =
             par->codec_id == AV_CODEC_ID_H264 ? kCMVideoCodecType_H264 : kCMVideoCodecType_HEVC;
-        const char *codec = par->codec_id == AV_CODEC_ID_H264 ? "H.264" : "HEVC";
-
-        Chroma chroma;
-        switch (fmt.chroma) {
-        case 420:
-            chroma = Chroma::C420;
-            break;
-        case 422:
-            chroma = Chroma::C422;
-            break;
-        case 444:
-            chroma = Chroma::C444;
-            break;
-        default:
-            reason =
-                fmt::format("{} with chroma format {} (e.g. monochrome)", codec, fmt.chroma);
-            return false;
-        }
-
-        if (fmt.bit_depth == 8)
-            choice.output_format = output_format_for(Packing::Bits8, chroma, full_range);
-        else if (fmt.bit_depth == 10)
-            choice.output_format = output_format_for(Packing::Bits10InMsbs, chroma, full_range);
-        else if (fmt.bit_depth == 12 && par->codec_id == AV_CODEC_ID_HEVC) {
-            // VideoToolbox decodes these in software. Its 12 bit 4:2:0 chroma doesn't
-            // match FFmpeg's and is further from the source (design D4, spike 1.8),
-            // and there are no full range 16 bit formats to ask for.
-            if (chroma == Chroma::C420) {
-                reason = "12 bit 4:2:0 HEVC (VideoToolbox's chroma is inaccurate)";
-                return false;
-            }
-            if (full_range) {
-                reason = "full range 12 bit HEVC";
-                return false;
-            }
-            choice.output_format = output_format_for(Packing::Bits16, chroma, false);
-        }
-
-        if (!choice.output_format) {
-            reason = fmt::format("{} at {} bit {}", codec, fmt.bit_depth, fmt.chroma);
-            return false;
-        }
         return true;
     }
 
@@ -349,13 +199,63 @@ namespace {
         return (pkt->data[8 + 17] & 0x0f) != 0;
     }
 
-    AVPixelFormat target_pix_fmt(const OSType vt, const bool alpha) {
-        const OutputFormat *f = output_format(vt);
-        if (!f)
-            return AV_PIX_FMT_NONE;
-        if (f->packing == Packing::S4as && !alpha)
-            return AV_PIX_FMT_YUV444P12LE;
-        return f->target;
+    void populate_vt_shader_params(
+        utility::JsonStore &params,
+        const OutputFormat &format,
+        const VtColorSpace colorspace,
+        const int sample_storage_bits,
+        const bool interleaved_chroma) {
+        static const Imath::M33f bt601(
+            1., 0., 1.402, 1., -0.34413629, -0.71413629, 1., 1.772, -0.);
+        static const Imath::M33f bt2020(
+            1., -0., 1.4746, 1., -0.16455313, -0.57135313, 1., 1.8814, 0.);
+        static const Imath::M33f bt709(
+            1., 0., 1.5748, 1., -0.18732427, -0.46812427, 1., 1.8556, 0.);
+
+        const int bits = sample_storage_bits;
+        const int max_cv = (1 << bits) - 1;
+        params["half_scale_uvx"]    = format.chroma != Chroma::C444;
+        params["half_scale_uvy"]    = format.chroma == Chroma::C420;
+        params["norm_coeff"]        = 1.0f / float(max_cv);
+        params["vt_chroma_interleaved"] = interleaved_chroma;
+
+        Imath::M33f yuv_to_rgb;
+        switch (colorspace) {
+        case VtColorSpace::Bt2020:
+            yuv_to_rgb = bt2020;
+            break;
+        case VtColorSpace::Bt709:
+            yuv_to_rgb = bt709;
+            break;
+        case VtColorSpace::Smpte240:
+        case VtColorSpace::Bt601:
+        case VtColorSpace::Unspecified:
+        default:
+            yuv_to_rgb = bt601;
+            break;
+        }
+
+        if (format.full_range) {
+            const float neutral = std::pow(2.0f, float(bits - 1));
+            params["yuv_offsets"] = {"ivec3", 1, 0.0f, neutral, neutral};
+        } else {
+            const float y_min  = 16.0f * std::pow(2.0f, float(bits - 8));
+            const float y_max  = 235.0f * std::pow(2.0f, float(bits - 8));
+            const float uv_min = 16.0f * std::pow(2.0f, float(bits - 8));
+            const float uv_max = 240.0f * std::pow(2.0f, float(bits - 8));
+            Imath::M33f scale;
+            scale[0][0] = float(max_cv) / (y_max - y_min);
+            scale[1][1] = float(max_cv) / (uv_max - uv_min);
+            scale[2][2] = float(max_cv) / (uv_max - uv_min);
+            yuv_to_rgb *= scale;
+            params["yuv_offsets"] = {
+                "ivec3",
+                1,
+                y_min,
+                128.0f * std::pow(2.0f, float(bits - 8)),
+                128.0f * std::pow(2.0f, float(bits - 8))};
+        }
+        params["yuv_conv"] = yuv_to_rgb.transposed();
     }
 
     bool cf_equal(CFTypeRef value, CFStringRef key) {
@@ -365,59 +265,90 @@ namespace {
 
     // Colour metadata VideoToolbox attached to a decoded buffer, for fields the
     // container left unspecified (design D6).
-    void colour_from_attachments(CVPixelBufferRef pb, AVFrame *frame) {
-        if (frame->colorspace == AVCOL_SPC_UNSPECIFIED) {
+    void colour_from_attachments(
+        CVPixelBufferRef pb,
+        VtColorSpace &colorspace,
+        AVColorPrimaries &color_primaries,
+        AVColorTransferCharacteristic &color_trc) {
+        if (colorspace == VtColorSpace::Unspecified) {
             CFTypeRef m = CVBufferCopyAttachment(pb, kCVImageBufferYCbCrMatrixKey, nullptr);
             if (cf_equal(m, kCVImageBufferYCbCrMatrix_ITU_R_709_2))
-                frame->colorspace = AVCOL_SPC_BT709;
+                colorspace = VtColorSpace::Bt709;
             else if (cf_equal(m, kCVImageBufferYCbCrMatrix_ITU_R_601_4))
-                frame->colorspace = AVCOL_SPC_SMPTE170M;
+                colorspace = VtColorSpace::Bt601;
             else if (cf_equal(m, kCVImageBufferYCbCrMatrix_ITU_R_2020))
-                frame->colorspace = AVCOL_SPC_BT2020_NCL;
+                colorspace = VtColorSpace::Bt2020;
             else if (cf_equal(m, kCVImageBufferYCbCrMatrix_SMPTE_240M_1995))
-                frame->colorspace = AVCOL_SPC_SMPTE240M;
+                colorspace = VtColorSpace::Smpte240;
             if (m)
                 CFRelease(m);
         }
-        if (frame->color_primaries == AVCOL_PRI_UNSPECIFIED) {
+
+        if (color_primaries == AVCOL_PRI_UNSPECIFIED) {
             CFTypeRef p = CVBufferCopyAttachment(pb, kCVImageBufferColorPrimariesKey, nullptr);
             if (cf_equal(p, kCVImageBufferColorPrimaries_ITU_R_709_2))
-                frame->color_primaries = AVCOL_PRI_BT709;
+                color_primaries = AVCOL_PRI_BT709;
             else if (cf_equal(p, kCVImageBufferColorPrimaries_ITU_R_2020))
-                frame->color_primaries = AVCOL_PRI_BT2020;
+                color_primaries = AVCOL_PRI_BT2020;
             else if (cf_equal(p, kCVImageBufferColorPrimaries_P3_D65))
-                frame->color_primaries = AVCOL_PRI_SMPTE432;
+                color_primaries = AVCOL_PRI_SMPTE432;
             else if (cf_equal(p, kCVImageBufferColorPrimaries_DCI_P3))
-                frame->color_primaries = AVCOL_PRI_SMPTE431;
+                color_primaries = AVCOL_PRI_SMPTE431;
             else if (cf_equal(p, kCVImageBufferColorPrimaries_EBU_3213))
-                frame->color_primaries = AVCOL_PRI_BT470BG;
+                color_primaries = AVCOL_PRI_BT470BG;
             else if (cf_equal(p, kCVImageBufferColorPrimaries_SMPTE_C))
-                frame->color_primaries = AVCOL_PRI_SMPTE170M;
+                color_primaries = AVCOL_PRI_SMPTE170M;
             if (p)
                 CFRelease(p);
         }
-        if (frame->color_trc == AVCOL_TRC_UNSPECIFIED) {
+        if (color_trc == AVCOL_TRC_UNSPECIFIED) {
             CFTypeRef t =
                 CVBufferCopyAttachment(pb, kCVImageBufferTransferFunctionKey, nullptr);
             if (cf_equal(t, kCVImageBufferTransferFunction_ITU_R_709_2))
-                frame->color_trc = AVCOL_TRC_BT709;
+                color_trc = AVCOL_TRC_BT709;
             else if (cf_equal(t, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ))
-                frame->color_trc = AVCOL_TRC_SMPTE2084;
+                color_trc = AVCOL_TRC_SMPTE2084;
             else if (cf_equal(t, kCVImageBufferTransferFunction_ITU_R_2100_HLG))
-                frame->color_trc = AVCOL_TRC_ARIB_STD_B67;
+                color_trc = AVCOL_TRC_ARIB_STD_B67;
             else if (cf_equal(t, kCVImageBufferTransferFunction_ITU_R_2020))
-                frame->color_trc = AVCOL_TRC_BT2020_10;
+                color_trc = AVCOL_TRC_BT2020_10;
             else if (cf_equal(t, kCVImageBufferTransferFunction_SMPTE_240M_1995))
-                frame->color_trc = AVCOL_TRC_SMPTE240M;
+                color_trc = AVCOL_TRC_SMPTE240M;
             if (t)
                 CFRelease(t);
         }
     }
 
-    // Same ownership trick as setup_video_buffer() in ffmpeg_stream.cpp: the
-    // AVBufferRef in frame->buf[0] owns a heap-allocated ImageBufPtr that keeps the
-    // pixel memory alive and lets FFMpegStream take the ImageBuffer over.
-    void image_buf_ptr_deleter(void *, uint8_t *data) { delete (ImageBufPtr *)data; }
+    VtColorSpace vt_colorspace_from_stream(const AVColorSpace colorspace) {
+        switch (colorspace) {
+        case AVCOL_SPC_BT709:
+            return VtColorSpace::Bt709;
+        case AVCOL_SPC_BT2020_NCL:
+        case AVCOL_SPC_BT2020_CL:
+            return VtColorSpace::Bt2020;
+        case AVCOL_SPC_SMPTE240M:
+            return VtColorSpace::Smpte240;
+        case AVCOL_SPC_BT470BG:
+        case AVCOL_SPC_SMPTE170M:
+            return VtColorSpace::Bt601;
+        default:
+            return VtColorSpace::Unspecified;
+        }
+    }
+
+    const char *vt_colorspace_name(const VtColorSpace colorspace) {
+        switch (colorspace) {
+        case VtColorSpace::Bt709:
+            return "bt709";
+        case VtColorSpace::Bt2020:
+            return "bt2020";
+        case VtColorSpace::Smpte240:
+            return "smpte240";
+        case VtColorSpace::Bt601:
+        case VtColorSpace::Unspecified:
+            return "bt601";
+        }
+    }
 
 } // namespace
 
@@ -426,13 +357,11 @@ struct VtDecoder::Impl {
     CMVideoFormatDescriptionRef format = nullptr;
     Choice choice;
     AVRational time_base = {1, 1};
-    int width            = 0;
-    int height           = 0;
-    bool full_range      = false;
+    OSType output_format = 0;
     bool has_alpha       = false;
     bool first_packet    = true;
     bool hardware        = false;
-    AVColorSpace colorspace;
+    VtColorSpace colorspace = VtColorSpace::Unspecified;
     AVColorPrimaries primaries;
     AVColorTransferCharacteristic trc;
 
@@ -516,14 +445,11 @@ std::unique_ptr<VtDecoder> VtDecoder::create(const AVStream *stream, std::string
 
     const AVCodecParameters *par = stream->codecpar;
     impl->time_base              = stream->time_base;
-    impl->width                  = par->width;
-    impl->height                 = par->height;
-    impl->full_range             = par->color_range == AVCOL_RANGE_JPEG;
-    impl->colorspace             = par->color_space;
+    impl->colorspace             = vt_colorspace_from_stream(par->color_space);
     impl->primaries              = par->color_primaries;
     impl->trc                    = par->color_trc;
     // Until the first ProRes frame header says otherwise, 4444 is assumed to have alpha.
-    impl->has_alpha = impl->choice.output_format == ks4as;
+    impl->has_alpha = impl->choice.prores_4444;
 
     CFMutableDictionaryRef extensions = CFDictionaryCreateMutable(
         nullptr, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
@@ -555,12 +481,26 @@ std::unique_ptr<VtDecoder> VtDecoder::create(const AVStream *stream, std::string
         kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder,
         kCFBooleanTrue);
 
+    CFMutableArrayRef supported_formats = CFArrayCreateMutable(
+        nullptr, 0, &kCFTypeArrayCallBacks);
+    for (const auto &format : k_output_formats) {
+        const SInt32 value = SInt32(format.vt);
+        CFNumberRef number = CFNumberCreate(nullptr, kCFNumberSInt32Type, &value);
+        CFArrayAppendValue(supported_formats, number);
+        CFRelease(number);
+    }
     CFMutableDictionaryRef attributes = CFDictionaryCreateMutable(
         nullptr, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    const SInt32 pixel_format = SInt32(impl->choice.output_format);
-    CFNumberRef number        = CFNumberCreate(nullptr, kCFNumberSInt32Type, &pixel_format);
-    CFDictionarySetValue(attributes, kCVPixelBufferPixelFormatTypeKey, number);
-    CFRelease(number);
+    if (impl->choice.prores_4444) {
+        const SInt32 value = SInt32(ks4as);
+        CFNumberRef number = CFNumberCreate(nullptr, kCFNumberSInt32Type, &value);
+        CFDictionarySetValue(attributes, kCVPixelBufferPixelFormatTypeKey, number);
+        CFRelease(number);
+    } else {
+        CFDictionarySetValue(
+            attributes, kCVPixelBufferPixelFormatTypeKey, supported_formats);
+    }
+    CFRelease(supported_formats);
 
     VTDecompressionOutputCallbackRecord callback{&Impl::output_callback, impl.get()};
     status = VTDecompressionSessionCreate(
@@ -613,7 +553,7 @@ int VtDecoder::send_packet(const AVPacket *packet) {
 
     if (d.first_packet) {
         d.first_packet = false;
-        if (d.choice.output_format == ks4as)
+        if (d.choice.prores_4444)
             d.has_alpha = prores_frame_has_alpha(packet);
     }
 
@@ -676,7 +616,7 @@ int VtDecoder::send_packet(const AVPacket *packet) {
     return 0;
 }
 
-int VtDecoder::receive_frame(AVFrame *frame) {
+int VtDecoder::receive_frame(ImageBufPtr &image) {
 
     Impl &d             = *impl_;
     CVPixelBufferRef pb = nullptr;
@@ -699,91 +639,90 @@ int VtDecoder::receive_frame(AVFrame *frame) {
         d.decoded.erase(first);
     }
 
-    const AVPixelFormat target     = target_pix_fmt(d.choice.output_format, d.has_alpha);
-    const int w                    = int(CVPixelBufferGetWidth(pb));
-    const int h                    = int(CVPixelBufferGetHeight(pb));
-    const vt_repack::Layout layout = vt_repack::planar_layout(target, w, h);
-
-    ImageBufPtr image(new ImageBuffer());
-    auto *base = reinterpret_cast<uint8_t *>(image->allocate(layout.total_size + 4096));
-
-    auto dst = [&](const int i) -> vt_repack::DstPlane {
-        return {base + layout.offsets[i], layout.linesizes[i]};
-    };
-
-    CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
-    auto src = [&](const size_t i) -> vt_repack::SrcPlane {
-        return {
-            static_cast<const uint8_t *>(CVPixelBufferGetBaseAddressOfPlane(pb, i)),
-            CVPixelBufferGetBytesPerRowOfPlane(pb, i)};
-    };
-
     const OSType got       = CVPixelBufferGetPixelFormatType(pb);
-    const OutputFormat *of = got == d.choice.output_format ? output_format(got) : nullptr;
+    const OutputFormat *of = output_format(got);
     const bool ok          = of != nullptr;
-    if (of) {
-        switch (of->packing) {
-        case Packing::Bits8:
-            vt_repack::biplanar8_to_planar8(
-                src(0), src(1), dst(0), dst(1), dst(2), w, h, of->chroma);
-            break;
-        case Packing::Bits10InMsbs:
-            vt_repack::biplanar10_to_planar10(
-                src(0), src(1), dst(0), dst(1), dst(2), w, h, of->chroma);
-            break;
-        case Packing::Bits16:
-            vt_repack::biplanar16_to_planar12(
-                src(0), src(1), dst(0), dst(1), dst(2), w, h, of->chroma);
-            break;
-        case Packing::S4as:
-            vt_repack::s4as_to_yuva444p12(
-                src(0),
-                src(1),
-                src(2),
-                dst(0),
-                dst(1),
-                dst(2),
-                d.has_alpha ? dst(3) : vt_repack::DstPlane{nullptr, 0},
-                w,
-                h);
-            break;
-        }
-    }
-
+    d.output_format        = got;
     if (ok) {
-        av_frame_unref(frame);
-        frame->format                = target;
-        frame->width                 = w;
-        frame->height                = h;
-        frame->pts                   = pts;
-        frame->best_effort_timestamp = pts;
-        frame->color_range           = of->full_range ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
-        frame->colorspace            = d.colorspace;
-        frame->color_primaries       = d.primaries;
-        frame->color_trc             = d.trc;
-        colour_from_attachments(pb, frame);
-
-        for (int i = 0; i < layout.planes; ++i) {
-            frame->data[i]     = base + layout.offsets[i];
-            frame->linesize[i] = int(layout.linesizes[i]);
+        const int w              = int(CVPixelBufferGetWidth(pb));
+        const int h              = int(CVPixelBufferGetHeight(pb));
+        const size_t plane_count = CVPixelBufferGetPlaneCount(pb);
+        std::array<size_t, 4> plane_sizes{};
+        size_t total_size = 0;
+        for (size_t i = 0; i < plane_count && i < plane_sizes.size(); ++i) {
+            plane_sizes[i] = CVPixelBufferGetBytesPerRowOfPlane(pb, i) *
+                             CVPixelBufferGetHeightOfPlane(pb, i);
+            total_size += plane_sizes[i];
         }
-        frame->extended_data = frame->data;
-        frame->buf[0]        = av_buffer_create(
-            reinterpret_cast<uint8_t *>(new ImageBufPtr(image)),
-            sizeof(ImageBufPtr),
-            image_buf_ptr_deleter,
-            nullptr,
-            0);
+
+        image.reset(new ImageBuffer());
+        auto *base = reinterpret_cast<uint8_t *>(image->allocate(total_size + 4096));
+        utility::JsonStore params;
+        if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) == kCVReturnSuccess) {
+            size_t offset = 0;
+            for (size_t i = 0; i < plane_count && i < 4; ++i) {
+                const auto stride = CVPixelBufferGetBytesPerRowOfPlane(pb, i);
+                const auto rows   = CVPixelBufferGetHeightOfPlane(pb, i);
+                const auto *src =
+                    static_cast<const uint8_t *>(CVPixelBufferGetBaseAddressOfPlane(pb, i));
+                const size_t plane_size = stride * rows;
+                std::memcpy(base + offset, src, plane_size);
+                if (of->packing == Packing::S4as && i == 2) {
+                    params["a_linesize"]           = int(stride);
+                    params["a_plane_bytes_offset"] = offset;
+                } else if (i == 0) {
+                    params["y_linesize"]           = int(stride);
+                    params["y_plane_bytes_offset"] = offset;
+                } else if (i == 1) {
+                    params["u_linesize"]           = int(stride);
+                    params["u_plane_bytes_offset"] = offset;
+                } else if (i == 2) {
+                    params["v_linesize"]           = int(stride);
+                    params["v_plane_bytes_offset"] = offset;
+                }
+                offset += plane_size;
+            }
+            CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+        } else {
+            CVPixelBufferRelease(pb);
+            return AVERROR_EXTERNAL;
+        }
+
+        VtColorSpace colorspace                  = d.colorspace;
+        AVColorPrimaries color_primaries        = d.primaries;
+        AVColorTransferCharacteristic color_trc = d.trc;
+        colour_from_attachments(pb, colorspace, color_primaries, color_trc);
+
+        const int sample_storage_bits =
+            of->packing == Packing::Bits8
+                ? 8
+                : (of->packing == Packing::Bits10InMsbs ? 10 : 16);
+        params["vt_sample_bits"] = sample_storage_bits;
+        populate_vt_shader_params(params, *of, colorspace, sample_storage_bits, true);
+
+        utility::JsonStore metadata;
+        metadata["pts"]             = pts;
+        metadata["pixel_format"]    = uint32_t(got);
+        metadata["color_space"]     = vt_colorspace_name(colorspace);
+        metadata["color_primaries"] = int(color_primaries);
+        metadata["color_trc"]       = int(color_trc);
+        metadata["full_range"]      = of->full_range;
+        metadata["value_bits"] =
+            of->packing == Packing::S4as || of->packing == Packing::Bits16
+                ? 12
+                : sample_storage_bits;
+        metadata["has_alpha"] = params.value("a_linesize", 0) != 0;
+        image->set_image_dimensions({w, h});
+        image->set_shader_params(params);
+        image->set_metadata(metadata);
+        image->set_display_timestamp_seconds(
+            double(pts) * double(d.time_base.num) / double(d.time_base.den));
     }
 
-    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
     CVPixelBufferRelease(pb);
 
     if (!ok) {
-        spdlog::warn(
-            "VideoToolbox returned pixel format {}, expected {}",
-            fourcc_string(got),
-            fourcc_string(d.choice.output_format));
+        spdlog::warn("VideoToolbox selected unsupported pixel format {}", fourcc_string(got));
         return AVERROR_EXTERNAL;
     }
     return 0;
@@ -797,12 +736,8 @@ void VtDecoder::flush() {
     impl_->draining = false;
 }
 
-AVPixelFormat VtDecoder::output_pix_fmt() const {
-    return target_pix_fmt(impl_->choice.output_format, impl_->has_alpha);
-}
-
 std::string VtDecoder::output_format_name() const {
-    return fourcc_string(impl_->choice.output_format);
+    return impl_->output_format ? fourcc_string(impl_->output_format) : "automatic";
 }
 
 bool VtDecoder::using_hardware() const { return impl_->hardware; }

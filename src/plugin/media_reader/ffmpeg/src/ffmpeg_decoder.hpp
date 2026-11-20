@@ -2,10 +2,11 @@
 #pragma once
 
 #include "ffmpeg_stream.hpp"
+#include "videotoolbox_mode.hpp"
 
 namespace xstudio::media_reader::ffmpeg {
 
-typedef std::shared_ptr<FFMpegStream> StreamPtr;
+typedef std::shared_ptr<FFMpegStreamInterface> StreamPtr;
 
 class FFMpegDecoder {
   public:
@@ -50,6 +51,7 @@ class FFMpegDecoder {
     void close_handles();
     int64_t decode_and_store_next_frame();
     int64_t decode_next_frame();
+    int send_packet();
 
     ImageBufPtr get_frame_and_release_from_mini_cache(const int frame_num);
 

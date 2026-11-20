@@ -4,6 +4,9 @@
 
 #include "ffmpeg_decoder.hpp"
 #include "xstudio/media/media_error.hpp"
+#ifdef XSTUDIO_HAS_VIDEOTOOLBOX
+#include "ffmpeg_stream_videotoolbox.hpp"
+#endif
 
 #ifdef __GNUC__ // Check if GCC compiler is being used
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
@@ -64,16 +67,31 @@ void FFMpegDecoder::open_handles() {
     // Find all of the video / data streams inside the file
     for (int i = 0; i < (int)av_format_ctx_->nb_streams; i++) {
         try {
+#ifdef XSTUDIO_HAS_VIDEOTOOLBOX
+            if (av_format_ctx_->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+                videotoolbox_mode_ != VideoToolboxMode::Off) {
+                auto videotoolbox_stream = std::make_shared<FFMpegStreamVideoToolbox>(
+                    av_format_ctx_,
+                    av_format_ctx_->streams[i],
+                    i,
+                    ffmpeg_threads,
+                    movie_file_path_,
+                    videotoolbox_mode_);
+
+                if (videotoolbox_stream->available() ||
+                    (videotoolbox_mode_ == VideoToolboxMode::Only &&
+                     videotoolbox_stream->eligible()) ||
+                    !avcodec_find_decoder(
+                        av_format_ctx_->streams[i]->codecpar->codec_id)) {
+                    streams_[i] = videotoolbox_stream;
+                    continue;
+                }
+            }
+#endif
 
             streams_[i] = std::make_shared<FFMpegStream>(
-                av_format_ctx_,
-                av_format_ctx_->streams[i],
-                i,
-                ffmpeg_threads,
-                movie_file_path_,
-                videotoolbox_mode_);
-
-        } catch ([[maybe_unused]] std::exception &e) {
+                av_format_ctx_, av_format_ctx_->streams[i], i, ffmpeg_threads, movie_file_path_);
+        } catch ([[maybe_unused]] const std::exception &e) {
         }
     }
 
@@ -103,11 +121,11 @@ void FFMpegDecoder::calc_duration_frames() {
 
     for (auto &s : streams_) {
         auto &stream = s.second;
-        if (stream->codec_type() == AVMEDIA_TYPE_VIDEO && !primary_video_stream) {
+        if (stream->stream_type() == VIDEO_STREAM && !primary_video_stream) {
             if (best_video_stream == -1 || stream->stream_index() == best_video_stream) {
                 primary_video_stream = stream;
             }
-        } else if (stream->codec_type() == AVMEDIA_TYPE_AUDIO && !primary_audio_stream) {
+        } else if (stream->stream_type() == AUDIO_STREAM && !primary_audio_stream) {
             if (best_audio_stream == -1 || stream->stream_index() == best_audio_stream) {
                 primary_audio_stream = stream;
             }
@@ -229,7 +247,7 @@ int64_t FFMpegDecoder::decode_and_store_next_frame() {
     } else if (!read_code) { // frame read ok!
 
         if (decode_stream_ && avc_packet_->stream_index == decode_stream_->stream_index()) {
-            int rx = decode_stream_->send_packet(avc_packet_);
+            int rx = send_packet();
             if (rx)
                 AVC_CHECK_THROW(rx, "avcodec_send_packet");
             if (decode_stream_->receive_frame() == 0) {
@@ -281,8 +299,7 @@ int64_t FFMpegDecoder::decode_next_frame() {
     } else if (!read_code) { // frame read ok!
 
         if (decode_stream_ && avc_packet_->stream_index == decode_stream_->stream_index()) {
-            int rx = decode_stream_->send_packet(avc_packet_);
-            av_packet_unref(avc_packet_);
+            int rx = send_packet();
             if (rx)
                 AVC_CHECK_THROW(rx, "avcodec_send_packet");
             return decode_stream_->receive_frame();
@@ -294,6 +311,33 @@ int64_t FFMpegDecoder::decode_next_frame() {
         AVC_CHECK_THROW(read_code, "av_read_frame");
     }
     return 0;
+}
+
+int FFMpegDecoder::send_packet() {
+#ifdef XSTUDIO_HAS_VIDEOTOOLBOX
+    try {
+        return decode_stream_->send_packet(avc_packet_);
+    } catch (const videotoolbox_fallback_error &e) {
+        const int stream_index = decode_stream_->stream_index();
+        const auto frame_rate  = decode_stream_->frame_rate();
+        const auto stream      = av_format_ctx_->streams[stream_index];
+
+        spdlog::warn(
+            "{}: VideoToolbox can't decode this {} video ({}); using FFmpeg's decoder",
+            movie_file_path_,
+            avcodec_get_name(stream->codecpar->codec_id),
+            e.what());
+
+        auto software_stream = std::make_shared<FFMpegStream>(
+            av_format_ctx_, stream, stream_index, ffmpeg_threads, movie_file_path_);
+        software_stream->set_virtual_frame_rate(frame_rate);
+        streams_[stream_index] = software_stream;
+        decode_stream_         = std::move(software_stream);
+        return decode_stream_->send_packet(avc_packet_);
+    }
+#else
+    return decode_stream_->send_packet(avc_packet_);
+#endif
 }
 
 xstudio::utility::Timecode FFMpegDecoder::first_frame_timecode() {

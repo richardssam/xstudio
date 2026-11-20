@@ -40,9 +40,16 @@ echo "Writing test media to ${OUT}"
 "${FF[@]}" -f lavfi -i "${HD}" -c:v hevc_videotoolbox -profile:v main10 -pix_fmt p010le \
     -bf 2 -g 24 -b:v 8M -tag:v hvc1 -vf "${P709}" "${TAGS_709[@]}" "${OUT}/hevc_main10_bframes.mov"
 
-# HEVC Main 4:2:2 10, B-frames
-"${FF[@]}" -f lavfi -i "${HD}" -c:v hevc_videotoolbox -profile:v main42210 -pix_fmt p210le \
-    -bf 2 -g 24 -b:v 10M -tag:v hvc1 -vf "${P709}" "${TAGS_709[@]}" "${OUT}/hevc_422_10bit_bframes.mov"
+# HEVC Main 4:2:2 10, B-frames. Some older VideoToolbox encoder builds only
+# advertise 4:2:0 Main/Main10 and cannot generate this optional clip.
+if "${FFMPEG}" -hide_banner -h encoder=hevc_videotoolbox 2>&1 | grep -q "p210le" &&
+   "${FFMPEG}" -hide_banner -h encoder=hevc_videotoolbox 2>&1 | grep -q "main42210"; then
+    "${FF[@]}" -f lavfi -i "${HD}" -c:v hevc_videotoolbox -profile:v main42210 -pix_fmt p210le \
+        -bf 2 -g 24 -b:v 10M -tag:v hvc1 -vf "${P709}" "${TAGS_709[@]}" \
+        "${OUT}/hevc_422_10bit_bframes.mov"
+else
+    echo "Skipping HEVC 4:2:2: hevc_videotoolbox encoder lacks p210le/main42210"
+fi
 
 # HEVC Main (8 bit), open GOP with B-frames - leading pictures after each I frame
 "${FF[@]}" -f lavfi -i "${HD}" -c:v libx265 -pix_fmt yuv420p -tag:v hvc1 \
